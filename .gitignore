@@ -28,3 +28,6 @@ dist/
 # OS-generated files
 Thumbs.db
 .DS_Store
+
+#pyenv (optional)
+.python-version
