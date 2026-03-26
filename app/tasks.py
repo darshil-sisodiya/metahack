@@ -62,6 +62,7 @@ class BaseTask(ABC):
     _consecutive_stable_steps: int = field(default=0, init=False)
     _consecutive_instability_steps: int = field(default=0, init=False)
     _initial_pressure: float = field(default=1.0, init=False)
+    _previous_action: Action | None = field(default=None, init=False)
 
     # Global early failure thresholds (can be overridden per task)
     # These trigger before physical limits to simulate safety systems
@@ -85,6 +86,7 @@ class BaseTask(ABC):
         self._consecutive_failure_steps = 0
         self._consecutive_stable_steps = 0
         self._consecutive_instability_steps = 0
+        self._previous_action = None
 
         # Apply task-specific initial conditions
         obs = self._apply_initial_conditions(env)
@@ -225,6 +227,7 @@ class BaseTask(ABC):
 
         # Compute reward
         reward = self.compute_reward(obs, action, info)
+        self._previous_action = action.model_copy(deep=True)
 
         # Determine done status
         done = env_done or failed or success or self._step_count >= self.max_steps
@@ -246,6 +249,33 @@ class BaseTask(ABC):
         if len(window) < 2:
             return 0.0
         return float(np.var(list(window)))
+
+    def _apply_continuous_shaping(
+        self,
+        reward: Reward,
+        obs: Observation,
+        action: Action,
+        target_temp: float,
+    ) -> Reward:
+        """Add subtle continuous shaping without changing task objectives."""
+        temp_error = abs(obs.temperature - target_temp)
+        temp_reward = max(0.0, 1.0 - temp_error / 50.0) * 0.05
+        pressure_reward = max(0.0, 1.0 - obs.pressure / 3.0) * 0.03
+
+        smooth_penalty = 0.0
+        if self._previous_action is not None:
+            action_change = (
+                abs(action.steam_valve - self._previous_action.steam_valve)
+                + abs(action.reflux_ratio - self._previous_action.reflux_ratio)
+                + abs(action.feed_rate - self._previous_action.feed_rate)
+            )
+            smooth_penalty = -min(action_change / 300.0, 1.0) * 0.02
+
+        reward.value += temp_reward + pressure_reward + smooth_penalty
+        reward.components["temp_stability_shaping"] = temp_reward
+        reward.components["pressure_safety_shaping"] = pressure_reward
+        reward.components["smoothness_penalty"] = smooth_penalty
+        return reward
 
 
 @dataclass
@@ -357,7 +387,7 @@ class StabilizationTask(BaseTask):
         # Combined reward
         value = 0.6 * temp_score + 0.3 * pressure_score - 0.1 * variance_penalty
 
-        return Reward(
+        reward = Reward(
             value=value,
             components={
                 "temperature_score": temp_score,
@@ -365,6 +395,7 @@ class StabilizationTask(BaseTask):
                 "variance_penalty": -variance_penalty,
             },
         )
+        return self._apply_continuous_shaping(reward, obs, action, target_temp)
 
     def check_success(self, obs: Observation, info: dict) -> bool:
         """
@@ -533,7 +564,7 @@ class OptimizationTask(BaseTask):
 
         value -= instability_penalty
 
-        return Reward(
+        reward = Reward(
             value=value,
             components={
                 "purity_score": 0.5 * purity_score,
@@ -543,6 +574,7 @@ class OptimizationTask(BaseTask):
                 "consecutive_instability": float(self._consecutive_instability_steps),
             },
         )
+        return self._apply_continuous_shaping(reward, obs, action, target_temp=90.0)
 
     def check_success(self, obs: Observation, info: dict) -> bool:
         """
@@ -864,7 +896,7 @@ class EmergencyControlTask(BaseTask):
             - escalation_penalty
         )
 
-        return Reward(
+        reward = Reward(
             value=value,
             components={
                 "pressure_reduction_score": pressure_reduction_score,
@@ -874,6 +906,7 @@ class EmergencyControlTask(BaseTask):
                 "consecutive_stable_steps": float(self._consecutive_stable_steps),
             },
         )
+        return self._apply_continuous_shaping(reward, obs, action, temp_target)
 
     def check_success(self, obs: Observation, info: dict) -> bool:
         """

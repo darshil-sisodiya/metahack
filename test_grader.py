@@ -52,7 +52,7 @@ def run_test(agent_fn, name):
     print(f"Testing: {name}")
     print(f"{'='*60}")
 
-    results = evaluate_all_tasks(agent_fn, n_episodes=20)
+    results = evaluate_all_tasks(agent_fn, n_episodes=2000)
 
     print(f"\nOverall Score: {results['overall_score']:.2f}")
 
