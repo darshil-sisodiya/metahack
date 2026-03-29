@@ -29,5 +29,8 @@ dist/
 Thumbs.db
 .DS_Store
 
+# Secrets / environment variables
+.env
+
 #pyenv (optional)
 .python-version
