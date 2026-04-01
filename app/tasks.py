@@ -28,6 +28,7 @@ from typing import Any
 
 import numpy as np
 
+from app.config import get_task_config
 from app.env import DistillationEnv
 from app.models import Action, Observation, Reward
 
@@ -68,6 +69,35 @@ class BaseTask(ABC):
     # These trigger before physical limits to simulate safety systems
     EARLY_PRESSURE_FAILURE: float = field(default=2.8, init=False, repr=False)
     EARLY_TEMPERATURE_FAILURE: float = field(default=145.0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """
+        Merge YAML overrides from openenv.yaml over Python defaults.
+
+        The YAML ``parameters`` block for this task's ``name`` is loaded
+        via :func:`app.config.get_task_config`.  ``max_steps`` is treated
+        as a top-level dataclass field; every other key is merged into
+        ``self.config``.
+
+        If the YAML file is absent, malformed, or missing the task entry,
+        the Python-level defaults remain untouched.
+        """
+        yaml_params = get_task_config(self.name)
+        if not yaml_params:
+            return
+
+        # Override max_steps if the YAML provides it.
+        if "max_steps" in yaml_params:
+            self.max_steps = int(yaml_params.pop("max_steps"))
+
+        # Merge remaining keys into self.config (YAML wins over Python).
+        # Convert YAML lists back to tuples where the Python default is a tuple,
+        # so that downstream unpacking (e.g. `temp_min, temp_max = …`) is stable.
+        for key, value in yaml_params.items():
+            existing = self.config.get(key)
+            if isinstance(existing, tuple) and isinstance(value, list):
+                value = tuple(value)
+            self.config[key] = value
 
     def reset(self, env: DistillationEnv) -> Observation:
         """
@@ -122,6 +152,18 @@ class BaseTask(ABC):
 
         Returns:
             Tuple of (is_failed, failure_reason).
+        """
+        pass
+
+    def _update_internal_state(self, obs: Observation, info: dict) -> None:
+        """
+        Update task-specific internal state before success/failure checks.
+
+        This hook runs after the observation is finalised (post-escalation)
+        but before check_success / check_failure / compute_reward, ensuring
+        that state mutations are visible to all three.
+
+        Override in subclasses to track counters, flags, etc.
         """
         pass
 
@@ -213,6 +255,9 @@ class BaseTask(ABC):
 
         # Increment step count
         self._step_count += 1
+
+        # Update task-specific internal state (before success/failure checks)
+        self._update_internal_state(obs, info)
 
         # Check early failure conditions first (global safety)
         early_failed, early_reason = self._check_early_failure(obs)
@@ -593,19 +638,25 @@ class OptimizationTask(BaseTask):
             )
         return False
 
+    def _update_internal_state(self, obs: Observation, info: dict) -> None:
+        """
+        Track consecutive low-purity steps before failure checks read them.
+        """
+        if obs.purity < self.config["low_purity_threshold"]:
+            self._consecutive_low_purity_steps += 1
+        else:
+            self._consecutive_low_purity_steps = 0
+
     def check_failure(self, obs: Observation, info: dict) -> tuple[bool, str]:
         """
         Check task-specific failure conditions.
 
         Note: Early failures handled by base class.
+        Counter is updated in _update_internal_state; this method only reads it.
         """
         # Low purity persistence
-        if obs.purity < self.config["low_purity_threshold"]:
-            self._consecutive_low_purity_steps += 1
-            if self._consecutive_low_purity_steps > self.config["low_purity_persistence_steps"]:
-                return True, f"Low purity persisted: {self._consecutive_low_purity_steps} steps"
-        else:
-            self._consecutive_low_purity_steps = 0
+        if self._consecutive_low_purity_steps > self.config["low_purity_persistence_steps"]:
+            return True, f"Low purity persisted: {self._consecutive_low_purity_steps} steps"
 
         # Instability persistence (stricter than escalation threshold)
         if self._consecutive_instability_steps >= self.config["instability_failure_steps"]:
@@ -848,6 +899,22 @@ class EmergencyControlTask(BaseTask):
             and pressure_variance <= self.config["stability_pressure_variance_threshold"]
         )
 
+    def _update_internal_state(self, obs: Observation, info: dict) -> None:
+        """
+        Track consecutive stable steps and recovery status.
+
+        Runs before check_success / check_failure so that
+        _recovery_achieved is up-to-date when those methods read it.
+        """
+        if self._is_stable(obs, info):
+            self._consecutive_stable_steps += 1
+        else:
+            self._consecutive_stable_steps = 0
+
+        required_steps = self.config["stability_required_consecutive_steps"]
+        if self._consecutive_stable_steps >= required_steps:
+            self._recovery_achieved = True
+
     def compute_reward(self, obs: Observation, action: Action, info: dict) -> Reward:
         """
         Compute emergency control reward.
@@ -855,8 +922,11 @@ class EmergencyControlTask(BaseTask):
         Components:
         - pressure_reduction_score: reward for reducing pressure
         - temperature_stability_score: reward for temperature near 100
-        - recovery_bonus: bonus if stable for >= 10 consecutive steps
+        - recovery_bonus: bonus if stable for >= required consecutive steps
         - escalation_penalty: penalty when escalation is active
+
+        Note: _consecutive_stable_steps and _recovery_achieved are read here
+        but mutated in _update_internal_state (called earlier in the step).
         """
         # Pressure reduction score
         pressure_reduction = (self._initial_pressure - obs.pressure) / self._initial_pressure
@@ -868,18 +938,8 @@ class EmergencyControlTask(BaseTask):
         temp_deviation = abs(obs.temperature - temp_target)
         temperature_stability_score = max(0.0, 1.0 - temp_deviation / temp_scale)
 
-        # Track consecutive stable steps
-        if self._is_stable(obs, info):
-            self._consecutive_stable_steps += 1
-        else:
-            self._consecutive_stable_steps = 0
-
-        # Recovery bonus
-        recovery_bonus = 0.0
-        required_steps = self.config["stability_required_consecutive_steps"]
-        if self._consecutive_stable_steps >= required_steps:
-            self._recovery_achieved = True
-            recovery_bonus = 1.0
+        # Recovery bonus (state already updated by _update_internal_state)
+        recovery_bonus = 1.0 if self._recovery_achieved else 0.0
 
         # Escalation penalty
         escalation = info.get("instability_escalation", 0.0)

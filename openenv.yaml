@@ -16,13 +16,77 @@ endpoints:
   state:
     - GET /state
     - POST /state
+
+# ─────────────────────────────────────────────────────────────
+# Task Parameters
+# These values are loaded at runtime by app/config.py.
+# Any key present here overrides the Python-level default.
+# Removing a key causes the code to fall back to its built-in
+# default, so the file is always safe to trim.
+# ─────────────────────────────────────────────────────────────
 tasks:
   - name: stabilization
     difficulty: easy
     objective: Keep the column near 100 C with low oscillation and safe pressure.
+    parameters:
+      max_steps: 50
+      target_temperature: 100.0
+      temperature_variance_threshold: 10.0
+      instability_temp_threshold: 10.0
+      instability_pressure_threshold: 0.15
+      temperature_min: 50.0
+      temperature_max: 140.0
+      success_temperature_tolerance: 15.0
+      pressure_reward_soft_threshold: 2.0
+      variance_penalty_scale: 0.1
+      variance_penalty_cap: 0.2
+
   - name: optimization
     difficulty: medium
     objective: Balance purity, throughput, and energy efficiency under process dynamics.
+    parameters:
+      max_steps: 75
+      max_energy_reference: 100.0
+      instability_temp_threshold: 25.0
+      instability_pressure_threshold: 0.2
+      instability_escalation_steps: 3
+      instability_escalation_rate: 0.1
+      low_purity_threshold: 45.0
+      low_purity_persistence_steps: 30
+      energy_growth_penalty_threshold: 2.0
+      target_purity: 80.0
+      target_flow_rate: 15.0
+      success_purity_threshold: 57.5
+      success_flow_rate_threshold: 12.0
+      success_temperature_variance_threshold: 30.0
+      instability_penalty_per_step: 0.05
+      instability_failure_steps: 5
+
   - name: emergency_control
     difficulty: hard
     objective: Recover the column from elevated pressure while maintaining safe operation.
+    parameters:
+      max_steps: 60
+      stability_temp_range: [85.0, 115.0]
+      stability_pressure_threshold: 1.5
+      stability_temp_variance_threshold: 15.0
+      stability_pressure_variance_threshold: 0.15
+      stability_required_consecutive_steps: 8
+      instability_temp_threshold: 15.0
+      instability_pressure_threshold: 0.15
+      instability_escalation_steps: 5
+      instability_escalation_rate: 0.04
+      cascading_pressure_threshold: 2.6
+      cascading_pressure_rate: 0.03
+      neutral_cooling_action: 50.0
+      cooling_efficiency_reduction: 0.8
+      pressure_growth_multiplier: 1.0
+      initial_temperature_range: [90.0, 110.0]
+      initial_pressure_range: [1.35, 1.65]
+      initial_purity_range: [40.0, 60.0]
+      initial_flow_rate: 15.0
+      temperature_target: 100.0
+      temperature_reward_scale: 40.0
+      escalation_penalty_scale: 0.5
+      escalation_penalty_cap: 0.3
+      hard_pressure_failure: 3.2
