@@ -51,6 +51,79 @@ What is not implemented yet:
 - No rich API endpoints beyond health check
 - No real config system wired through `openenv.yaml`
 
+## Hackathon Inference Script
+
+`inference.py` is the **mandatory hackathon submission entry point**. It uses the OpenAI-compatible Python client to drive an LLM agent through all three OpenEnv tasks (stabilization, optimization, emergency control).
+
+### How It Works
+
+1. The script loads environment variables from a local `.env` file (via `python-dotenv`).
+2. It initialises an OpenAI client pointed at the configured API endpoint.
+3. For each task it runs multiple seeded episodes:
+   - Builds a text prompt from the current `Observation`
+   - Sends it to the LLM via `client.chat.completions.create`
+   - Parses the JSON response into an `Action` (with robust fallback handling)
+   - Steps the environment via `task.step(env, action)`
+   - Logs reward, success/failure, and final summary
+
+### Environment Variables
+
+The script requires three environment variables:
+
+| Variable | Purpose | Example |
+| --- | --- | --- |
+| `API_BASE_URL` | OpenAI-compatible API endpoint | `https://generativelanguage.googleapis.com/v1beta/openai/` |
+| `MODEL_NAME` | Model identifier served at that endpoint | `gemini-2.5-flash` |
+| `HF_TOKEN` | API key (also reads `API_KEY` as fallback) | `hf_abc123...` or a Gemini/OpenAI key |
+
+#### Local Setup
+
+1. Copy the template:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Edit `.env` and fill in your real credentials:
+
+   ```env
+   API_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"
+   MODEL_NAME="gemini-2.5-flash"
+   HF_TOKEN="your-actual-api-key"
+   ```
+
+3. `.env` is listed in `.gitignore` — your secrets will **never** be committed.
+
+### Rate Limiting (`API_CALL_DELAY`)
+
+Free-tier APIs (e.g. Gemini) enforce strict rate limits (typically 5 RPM). To avoid `HTTP 429 Too Many Requests` errors, `inference.py` contains a configurable delay:
+
+```python
+# inference.py — near the call_llm() function
+API_CALL_DELAY: int = 15  # seconds between API calls
+```
+
+| Scenario | Recommended `API_CALL_DELAY` |
+| --- | --- |
+| **Free-tier Gemini** (5 RPM) | `15` (default — gives 4 RPM headroom) |
+| **Paid OpenAI / vLLM** | `0` (no throttle needed) |
+| **HuggingFace Inference API** | `5`–`10` depending on plan |
+
+Change this value directly in `inference.py` to match your API tier.
+
+### Running the Script
+
+```bash
+# Activate the virtual environment
+source venv/bin/activate   # Linux/Mac
+venv\Scripts\activate      # Windows
+
+# Run inference
+python inference.py
+```
+
+The script will log progress for each episode and print a final summary table across all tasks.
+
 ## Repository Layout
 
 | Path | Purpose | Notes |
@@ -62,9 +135,11 @@ What is not implemented yet:
 | `app/grader.py` | Evaluation layer | Converts full episodes into scores and aggregates multi-task results |
 | `app/baseline.py` | Heuristic baseline | Deterministic reference controller plus CLI entry point |
 | `app/main.py` | FastAPI shell | Only exposes `/` health check currently |
+| `inference.py` | **Hackathon LLM inference script** | Drives all tasks via OpenAI client; mandatory submission entry point |
 | `test.py` | Random-policy task difficulty probe | Reports survival/success under random actions |
 | `test_grader.py` | Ad hoc grader smoke test | Compares several simple agents |
-| `requirements.txt` | Python dependencies | FastAPI, Pydantic, Uvicorn, NumPy |
+| `requirements.txt` | Python dependencies | FastAPI, Pydantic, Uvicorn, NumPy, OpenAI, python-dotenv |
+| `.env.example` | Environment variable template | Copy to `.env` and fill in real API credentials |
 | `Dockerfile` | Container image definition | Runs `uvicorn app.main:app` |
 | `openenv.yaml` | Placeholder config file | Present, but not used by runtime code today |
 
@@ -970,6 +1045,8 @@ Current dependencies:
 - `pydantic`
 - `uvicorn`
 - `numpy`
+- `openai`
+- `python-dotenv`
 
 ### `Dockerfile`
 
