@@ -8,9 +8,8 @@ The required submission entry point is a root-level `inference.py` file that:
 - emits structured stdout logs using [START], [STEP], and [END] markers
 - produces normalized 0.0-1.0 scores for each task and an overall score
 
-For local offline smoke testing, the script also supports a deterministic
-heuristic mode via `OPENENV_AGENT_MODE=heuristic`. Submission mode defaults
-to `llm` and will fail fast if the API configuration is missing.
+The script is intended to run in LLM mode and will fail fast if the API
+configuration is missing.
 """
 
 from __future__ import annotations
@@ -37,43 +36,23 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 API_KEY = HF_TOKEN or OPENAI_API_KEY or os.environ.get("API_KEY", "").strip()
 
-OPENENV_AGENT_MODE = os.environ.get("OPENENV_AGENT_MODE", "llm").strip().lower()
 OPENENV_EPISODES_PER_TASK = max(1, int(os.environ.get("OPENENV_EPISODES_PER_TASK", "1")))
 OPENENV_BASE_SEED = int(os.environ.get("OPENENV_BASE_SEED", "42"))
 OPENENV_REQUEST_TIMEOUT = float(os.environ.get("OPENENV_REQUEST_TIMEOUT", "60"))
 API_CALL_DELAY = max(0.0, float(os.environ.get("API_CALL_DELAY", "0")))
 
-SAFE_FALLBACK_ACTION = Action(
-    steam_valve=50.0,
-    reflux_ratio=50.0,
-    feed_rate=50.0,
-    vent=0,
-)
-
-
-def resolve_agent_mode() -> str:
-    """Resolve the requested agent mode."""
-    if OPENENV_AGENT_MODE not in {"llm", "heuristic"}:
-        raise ValueError(
-            "OPENENV_AGENT_MODE must be one of: llm or heuristic."
-        )
-    return OPENENV_AGENT_MODE
-
-
-AGENT_MODE = resolve_agent_mode()
+AGENT_MODE = "llm"
 
 
 def build_client() -> OpenAI | None:
     """Create the OpenAI-compatible client when running in LLM mode."""
-    if AGENT_MODE != "llm":
-        return None
     if not API_BASE_URL:
-        raise RuntimeError("API_BASE_URL must be set when OPENENV_AGENT_MODE=llm.")
+        raise RuntimeError("API_BASE_URL must be set for inference.py.")
     if not MODEL_NAME:
-        raise RuntimeError("MODEL_NAME must be set when OPENENV_AGENT_MODE=llm.")
+        raise RuntimeError("MODEL_NAME must be set for inference.py.")
     if not API_KEY:
         raise RuntimeError(
-            "HF_TOKEN or OPENAI_API_KEY must be set when OPENENV_AGENT_MODE=llm."
+            "HF_TOKEN or OPENAI_API_KEY must be set for inference.py."
         )
 
     return OpenAI(
@@ -144,9 +123,14 @@ def build_user_prompt(
     last_reward: float | None,
 ) -> str:
     """Build the step prompt from the current observation and state."""
+    prev_steam = state.prev_action.steam_valve if state.prev_action is not None else 50.0
+    prev_reflux = state.prev_action.reflux_ratio if state.prev_action is not None else 50.0
+    prev_feed = state.prev_action.feed_rate if state.prev_action is not None else 50.0
+    prev_vent = state.prev_action.vent if state.prev_action is not None else 0
+    prev_reward = last_reward if last_reward is not None else 0.0
     return f"""You are controlling a distillation column in a step-by-step simulation.
 
-You MUST adapt your actions based on the current state. Repeating the same action across steps is NOT allowed unless the state is unchanged.
+You MUST actively control the system. Passive or repeated actions will lead to failure.
 
 CURRENT STATE:
 
@@ -155,27 +139,68 @@ CURRENT STATE:
 * Purity: {observation.purity:.4f}
 * Flow rate: {observation.flow_rate:.4f}
 
-CONTROL OBJECTIVES:
+PREVIOUS ACTION:
+
+* Steam: {prev_steam:.4f}
+* Reflux: {prev_reflux:.4f}
+* Feed: {prev_feed:.4f}
+* Vent: {prev_vent}
+
+PREVIOUS REWARD:
+
+* Reward: {prev_reward:.4f}
+
+OBJECTIVES:
 
 * Keep temperature near 90
-* Keep pressure below 2.5 (CRITICAL: vent if high)
+* Keep pressure below 2.5 (CRITICAL SAFETY)
 * Increase purity above 60
 * Maintain stable operation
 
-CONTROL RULES (IMPORTANT):
+CONTROL RULES (STRICT):
 
-* If pressure > 2.2 -> set vent = 1 and reduce steam
-* If temperature > 95 -> decrease steam
-* If temperature < 85 -> increase steam
-* If purity < 55 -> increase reflux
-* If purity > 65 -> reduce reflux
-* If flow_rate too low -> increase feed
-* If pressure rising -> reduce feed
+* If pressure > 2.2 -> vent = 1 AND reduce steam by at least 10
+* If temperature > 95 -> decrease steam by at least 5
+* If temperature < 85 -> increase steam by at least 5
+* If purity < 55 -> increase reflux by at least 5
+* If purity > 65 -> decrease reflux by at least 5
+* If pressure is increasing -> reduce feed
+* If system unstable -> prioritize safety over purity
+* If a change makes reward worse, reverse or reduce that change
+* Do not continuously increase the same variable if reward is not improving
+* Never push any variable to 100 unless absolutely necessary
+* If a variable exceeds 90, stop increasing it and adjust other variables instead
+* Maintain balance between steam, reflux, and feed
 
-ANTI-LAZY RULE:
+SAFETY RULE:
 
-* Do NOT repeat identical actions across steps if the state has changed
-* Adjust at least one control variable every step
+* If pressure is high or increasing rapidly, you MUST set vent = 1
+
+ANTI-LAZY RULES (MANDATORY):
+
+* You MUST change at least ONE control value every step
+* Do NOT repeat the previous action
+* If reward decreased, you MUST make a stronger adjustment (>= 5-10 units)
+* Avoid small useless changes (like +/-1)
+* You must use ALL control variables over time (steam, reflux, feed, vent)
+* Do not keep any variable constant for many steps
+* Avoid pushing any variable to extreme values (0 or 100) unless necessary
+* Use all variables over time (steam, reflux, feed, vent)
+* Do not rely on only one variable to control the system
+* If reward decreases, adjust a DIFFERENT variable instead of repeating the same change
+
+STABILITY STRATEGY:
+
+* Make gradual but meaningful adjustments
+* Avoid oscillations (don't reverse direction every step)
+* If system improves, continue in same direction slightly
+* Balance multiple controls instead of relying on one variable
+* If one variable reaches a high value (>85), adjust other variables instead
+* Use vent when pressure is high, do not ignore safety
+* Avoid large swings in values (>15 change in one step)
+* Prefer moderate adjustments (5-10 units)
+* Do not drastically reduce feed below 20 unless pressure is critical
+* Keep feed within a reasonable operating range (20-70)
 
 OUTPUT FORMAT (STRICT JSON ONLY):
 {{
@@ -185,10 +210,12 @@ OUTPUT FORMAT (STRICT JSON ONLY):
 "vent": 0 or 1
 }}
 
-NO explanations. NO text. ONLY JSON."""
+NO explanation.
+NO text.
+ONLY JSON."""
 
 
-def parse_model_action(response_text: str, fallback_action: Action) -> Action:
+def parse_model_action(response_text: str) -> Action:
     """Parse the model response into a validated Action."""
     text = response_text.strip()
 
@@ -204,7 +231,7 @@ def parse_model_action(response_text: str, fallback_action: Action) -> Action:
         except Exception:
             pass
 
-    return fallback_action
+    raise ValueError("Model response was not valid strict JSON action output.")
 
 
 def choose_action_with_llm(
@@ -221,9 +248,8 @@ def choose_action_with_llm(
     if API_CALL_DELAY > 0:
         time.sleep(API_CALL_DELAY)
 
-    response_text = ""
     try:
-        response = CLIENT.chat.completions.create(
+        response = CLIENT.beta.chat.completions.parse(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": build_system_prompt(task_name, task_description)},
@@ -236,17 +262,17 @@ def choose_action_with_llm(
                     ),
                 },
             ],
-            max_tokens=128,
-            temperature=0.0,
+            temperature=0.4,
+            top_p=0.9,
+            response_format=Action,
         )
-        response_text = response.choices[0].message.content or ""
-    except Exception:
-        return SAFE_FALLBACK_ACTION
+    except Exception as exc:
+        raise RuntimeError(f"LLM request failed: {exc}") from exc
 
-    return parse_model_action(
-        response_text=response_text,
-        fallback_action=SAFE_FALLBACK_ACTION,
-    )
+    parsed = response.choices[0].message.parsed
+    if parsed is None:
+        raise ValueError("Model response did not contain a parsed Action payload.")
+    return parsed
 
 
 def choose_action(
@@ -257,16 +283,6 @@ def choose_action(
     last_reward: float | None,
 ) -> Action:
     """Choose the next action using the configured agent mode."""
-    if AGENT_MODE == "heuristic":
-        # Explicit offline/debug mode only. Submission mode should use `llm`.
-        steam_valve = max(30.0, min(70.0, 50.0 + (90.0 - observation.temperature)))
-        vent = 1 if observation.pressure > 2.0 else 0
-        return Action(
-            steam_valve=steam_valve,
-            reflux_ratio=50.0,
-            feed_rate=50.0,
-            vent=vent,
-        )
     return choose_action_with_llm(
         task_name=task_name,
         task_description=task_description,
@@ -296,8 +312,7 @@ def run_episode(task_name: str, episode_index: int, seed: int) -> dict[str, Any]
         "step_count": 0,
     }
 
-    model_name = MODEL_NAME if AGENT_MODE == "llm" else "heuristic-baseline"
-    print(f"[START] task={task_name} env=openenv model={model_name}", flush=True)
+    print(f"[START] task={task_name} env=openenv model={MODEL_NAME}", flush=True)
 
     while not done:
         state = runtime.state()
@@ -371,7 +386,7 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "kind": "summary",
         "mode": AGENT_MODE,
-        "model": MODEL_NAME if AGENT_MODE == "llm" else "heuristic-baseline",
+        "model": MODEL_NAME,
         "episodes_per_task": OPENENV_EPISODES_PER_TASK,
         "overall_score": round(overall_score, 6),
         "task_scores": {name: round(score, 6) for name, score in task_scores.items()},
