@@ -64,6 +64,12 @@ def build_client() -> OpenAI | None:
 
 CLIENT = build_client()
 
+memory = {
+    "best_reward": -1e9,
+    "best_action": None,
+    "reward_history": []
+}
+
 
 def compact_action(action: Action) -> dict[str, Any]:
     """Return a stable action payload for logs."""
@@ -128,9 +134,15 @@ def build_user_prompt(
     prev_feed = state.prev_action.feed_rate if state.prev_action is not None else 50.0
     prev_vent = state.prev_action.vent if state.prev_action is not None else 0
     prev_reward = last_reward if last_reward is not None else 0.0
+    best_action = memory["best_action"]
+    best_reward = memory["best_reward"]
+    best_steam = best_action.steam_valve if best_action else 50.0
+    best_reflux = best_action.reflux_ratio if best_action else 50.0
+    best_feed = best_action.feed_rate if best_action else 50.0
+    best_vent = best_action.vent if best_action else 0
     return f"""You are controlling a distillation column in a step-by-step simulation.
 
-You MUST actively control the system. Passive or repeated actions will lead to failure.
+You MUST actively control the system. Passive, repeated, or frozen actions will lead to failure.
 
 CURRENT STATE:
 
@@ -150,59 +162,118 @@ PREVIOUS REWARD:
 
 * Reward: {prev_reward:.4f}
 
+BEST KNOWN ACTION:
+
+* Steam: {best_steam}
+* Reflux: {best_reflux}
+* Feed: {best_feed}
+* Vent: {best_vent}
+* Best Reward: {best_reward}
+
 OBJECTIVES:
 
 * Keep temperature near 90
-* Keep pressure below 2.5 (CRITICAL SAFETY)
+* Keep pressure below 2.5 with vent-first safety behavior
 * Increase purity above 60
-* Maintain stable operation
+* Maintain stable operation while continuously adapting
 
 CONTROL RULES (STRICT):
 
-* If pressure > 2.2 -> vent = 1 AND reduce steam by at least 10
-* If temperature > 95 -> decrease steam by at least 5
-* If temperature < 85 -> increase steam by at least 5
-* If purity < 55 -> increase reflux by at least 5
-* If purity > 65 -> decrease reflux by at least 5
-* If pressure is increasing -> reduce feed
-* If system unstable -> prioritize safety over purity
-* If a change makes reward worse, reverse or reduce that change
-* Do not continuously increase the same variable if reward is not improving
+* If temperature > 95, decrease steam by at least 5
+* If temperature < 85, increase steam by at least 5
+* If purity < 55, increase reflux by at least 5
+* If purity > 65, decrease reflux by at least 5
+* If system is unstable, prioritize safety over purity
+* Use steam, reflux, feed, and vent over time; do not rely on only one control
 * Never push any variable to 100 unless absolutely necessary
-* If a variable exceeds 90, stop increasing it and adjust other variables instead
-* Maintain balance between steam, reflux, and feed
+* If a variable is already high, adjust other variables instead of only increasing it further
 
-SAFETY RULE:
+MEMORY & EXPLOITATION RULES:
 
-* If pressure is high or increasing rapidly, you MUST set vent = 1
+* If reward improves, continue in the SAME direction
+* Do NOT abandon strategies that previously gave high reward
+* If performance worsens, move BACK toward the best known action
+* Treat the best action as an anchor, not a fixed point
 
-ANTI-LAZY RULES (MANDATORY):
+CONTROLLED EXPLORATION RULE:
 
-* You MUST change at least ONE control value every step
-* Do NOT repeat the previous action
-* If reward decreased, you MUST make a stronger adjustment (>= 5-10 units)
-* Avoid small useless changes (like +/-1)
-* You must use ALL control variables over time (steam, reflux, feed, vent)
-* Do not keep any variable constant for many steps
-* Avoid pushing any variable to extreme values (0 or 100) unless necessary
-* Use all variables over time (steam, reflux, feed, vent)
-* Do not rely on only one variable to control the system
-* If reward decreases, adjust a DIFFERENT variable instead of repeating the same change
+* Do NOT repeat the same action more than 2 steps
+* Always explore small variations around the best action (+/-5 to +/-10)
+* Never remain completely constant
+
+REVERSAL RULE:
+
+* If reward decreases for 2 consecutive steps:
+* reverse the direction of previous changes
+* move back toward previously better values
+
+BALANCE RULE:
+
+* Do NOT change all variables in the same direction
+* Use a mix of variables (steam, reflux, feed, vent)
+* If one variable is high (>85), adjust others instead
 
 STABILITY STRATEGY:
 
-* Make gradual but meaningful adjustments
-* Avoid oscillations (don't reverse direction every step)
-* If system improves, continue in same direction slightly
-* Balance multiple controls instead of relying on one variable
-* If one variable reaches a high value (>85), adjust other variables instead
-* Use vent when pressure is high, do not ignore safety
-* Avoid large swings in values (>15 change in one step)
-* Prefer moderate adjustments (5-10 units)
-* Do not drastically reduce feed below 20 unless pressure is critical
-* Keep feed within a reasonable operating range (20-70)
+* Near good reward (>0.75), make small adjustments (<=5)
+* Avoid large swings (>15)
+* Maintain balance between all variables
 
-OUTPUT FORMAT (STRICT JSON ONLY):
+FEED SAFETY:
+
+* Do NOT reduce feed below 20 unless absolutely necessary
+* If feed < 20 and reward is decreasing, increase it
+
+VENT CONTROL (CRITICAL):
+
+* Vent is the PRIMARY pressure safety mechanism
+* If pressure > 2.0 -> vent MUST be 1
+* If pressure is increasing -> vent MUST be 1
+* If reward is decreasing and pressure not improving -> activate vent
+* Do NOT try to control pressure using only steam/reflux/feed
+
+ANTI-FREEZE RULE:
+
+* If action repeats twice, change at least TWO variables
+* Do NOT stay fixed at one configuration
+
+MICRO-ADJUSTMENT RULE:
+
+* Always change at least one variable slightly
+* Avoid zero-change decisions
+
+CRISIS DETECTION:
+
+* If reward drops significantly (more than 0.05 decrease)
+* OR reward decreases for 2 consecutive steps
+* THEN the system is in a BAD STATE
+
+CRISIS RESPONSE (MANDATORY):
+
+* When in a bad state, make LARGE corrective changes (10-20 units)
+* Do NOT continue current strategy
+* Act aggressively to recover
+
+PRIORITY ACTIONS:
+
+1. If pressure is high OR system unstable:
+   * vent MUST be 1
+2. Increase feed if system is collapsing
+3. Adjust steam strongly (not small changes)
+
+ANTI-STAGNATION RULE:
+
+* If reward keeps decreasing, do NOT repeat similar actions
+* Try a DIFFERENT strategy completely
+
+RECOVERY GOAL:
+
+* Focus on stabilizing first, optimizing later
+* Safety and recovery > purity or efficiency
+
+OUTPUT FORMAT:
+
+Return ONLY JSON:
 {{
 "steam_valve": number (0-100),
 "reflux_ratio": number (0-100),
@@ -210,8 +281,8 @@ OUTPUT FORMAT (STRICT JSON ONLY):
 "vent": 0 or 1
 }}
 
-NO explanation.
-NO text.
+NO explanations.
+NO extra text.
 ONLY JSON."""
 
 
@@ -324,6 +395,12 @@ def run_episode(task_name: str, episode_index: int, seed: int) -> dict[str, Any]
             last_reward=last_reward,
         )
         observation, reward, done, info = runtime.step(action)
+        memory["reward_history"].append(reward.value)
+
+        if reward.value > memory["best_reward"]:
+            memory["best_reward"] = reward.value
+            memory["best_action"] = action
+
         cumulative_reward += reward.value
         reward_values.append(reward.value)
         last_reward = reward.value
