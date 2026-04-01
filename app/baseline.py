@@ -64,10 +64,11 @@ def main() -> None:
     results = evaluate_all_tasks(baseline_agent, n_episodes=200)
 
     print("BASELINE EVALUATION")
-    print(f"Overall Score: {results['overall_score']:.2f}")
+    print("Score Range: 0.000-1.000")
+    print(f"Overall Score: {results['overall_score']:.3f}")
     print("Per-Task Scores:")
     for task_name, score in results["task_scores"].items():
-        print(f"  {task_name}: {score:.2f}")
+        print(f"  {task_name}: {score:.3f}")
 
     print("Success Rates:")
     for task_name, task_details in results["details"].items():

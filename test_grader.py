@@ -54,11 +54,11 @@ def run_test(agent_fn, name):
 
     results = evaluate_all_tasks(agent_fn, n_episodes=2000)
 
-    print(f"\nOverall Score: {results['overall_score']:.2f}")
+    print(f"\nOverall Score: {results['overall_score']:.3f}")
 
     print("\nPer Task Scores:")
     for task, score in results["task_scores"].items():
-        print(f"  {task}: {score:.2f}")
+        print(f"  {task}: {score:.3f}")
 
     print("\nDetails:")
     for task, details in results["details"].items():

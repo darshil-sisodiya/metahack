@@ -7,22 +7,22 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from app.env import DistillationEnv
-from app.models import Action, Observation
-from app.tasks import BaseTask, get_task_by_name
+from app.models import Action, EnvironmentState, Observation, Reward
+from app.runtime import OpenEnvRuntime
 
 
 class ResetRequest(BaseModel):
     """Optional reset payload for selecting the active task."""
 
     task_name: str = "optimization"
+    seed: int = 42
 
 
 class StepResponse(BaseModel):
     """Response payload returned by the `/step` endpoint."""
 
     observation: Observation
-    reward: float
+    reward: Reward
     done: bool
     info: dict[str, Any]
 
@@ -33,9 +33,8 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Single shared environment instance for the running server.
-env: DistillationEnv | None = None
-task: BaseTask | None = None
+# Single shared runtime instance for the running server.
+runtime = OpenEnvRuntime()
 
 
 @app.get("/")
@@ -53,27 +52,35 @@ async def health_check() -> dict[str, str]:
 @app.post("/reset", response_model=Observation)
 async def reset_env(request: ResetRequest | None = None) -> Observation:
     """Create a new seeded environment/task instance and return the first observation."""
-    global env, task
-
     task_name = request.task_name if request is not None else "optimization"
-    task = get_task_by_name(task_name)
-    if task is None:
-        raise HTTPException(status_code=400, detail=f"Unknown task '{task_name}'.")
+    seed = request.seed if request is not None else 42
 
-    env = DistillationEnv(seed=42)
-    return task.reset(env)
+    try:
+        return runtime.reset(task_name=task_name, seed=seed)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/step", response_model=StepResponse)
 async def step_env(action: Action) -> StepResponse:
     """Advance the current environment by one step."""
-    if env is None or task is None:
-        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    try:
+        observation, reward, done, info = runtime.step(action)
+        return StepResponse(
+            observation=observation,
+            reward=reward,
+            done=done,
+            info=info,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    observation, reward, done, info = task.step(env, action)
-    return StepResponse(
-        observation=observation,
-        reward=reward.value,
-        done=done,
-        info=info,
-    )
+
+@app.get("/state", response_model=EnvironmentState)
+@app.post("/state", response_model=EnvironmentState)
+async def state_env() -> EnvironmentState:
+    """Return the current environment state."""
+    try:
+        return runtime.state()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

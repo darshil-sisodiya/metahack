@@ -1,4 +1,28 @@
 # OpenEnv Configuration
-name: openenv
-version: "0.1.0"
+name: openenv-distillation-control
+version: "0.2.0"
+description: Industrial distillation-column control benchmark with typed OpenEnv reset/step/state APIs.
 entrypoint: uvicorn app.main:app --host 0.0.0.0 --port 7860
+port: 7860
+framework: fastapi
+tags:
+  - openenv
+  - industrial-control
+  - process-operations
+endpoints:
+  health: GET /health
+  reset: POST /reset
+  step: POST /step
+  state:
+    - GET /state
+    - POST /state
+tasks:
+  - name: stabilization
+    difficulty: easy
+    objective: Keep the column near 100 C with low oscillation and safe pressure.
+  - name: optimization
+    difficulty: medium
+    objective: Balance purity, throughput, and energy efficiency under process dynamics.
+  - name: emergency_control
+    difficulty: hard
+    objective: Recover the column from elevated pressure while maintaining safe operation.

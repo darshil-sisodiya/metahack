@@ -1,405 +1,398 @@
-"""OpenEnv Inference Script — Hackathon Submission
+"""Submission inference script for the OpenEnv distillation benchmark.
 
-Drives all three distillation-column tasks (stabilization, optimization,
-emergency_control) with an LLM agent via the OpenAI-compatible chat API.
+The required submission entry point is a root-level `inference.py` file that:
 
-Required environment variables:
-    API_BASE_URL  – OpenAI-compatible endpoint (e.g. vLLM / TGI)
-    MODEL_NAME    – HuggingFace model identifier served at that endpoint
-    HF_TOKEN      – HuggingFace token used as the API key
+- uses the OpenAI-compatible client for LLM inference in submission mode
+- reads API configuration from environment variables
+- runs deterministic seeded rollouts across all tasks
+- emits structured stdout logs using [START], [STEP], and [END] markers
+- produces normalized 0.0-1.0 scores for each task and an overall score
 
-Usage:
-    python inference.py
+For local offline smoke testing, the script also supports a deterministic
+heuristic mode via `OPENENV_AGENT_MODE=heuristic`. Submission mode defaults
+to `llm` and will fail fast if the API configuration is missing.
 """
 
 from __future__ import annotations
 
 import json
-import time
-import logging
 import os
 import re
-import sys
-import textwrap
+import time
 from typing import Any
 
 from dotenv import load_dotenv
-
-load_dotenv()  # Load .env before any os.environ.get() calls
-
 from openai import OpenAI
 
-from app.env import DistillationEnv
-from app.models import Action, Observation
+from app.grader import TASK_WEIGHTS, compute_episode_score
+from app.models import Action, EnvironmentState, Observation
+from app.runtime import OpenEnvRuntime
 from app.tasks import get_all_tasks, get_task_by_name
 
-# ──────────────────────────────────────────────────────────────────────
-# Logging
-# ──────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s │ %(levelname)-7s │ %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("openenv-inference")
+load_dotenv()
 
-# ──────────────────────────────────────────────────────────────────────
-# Configuration from environment
-# ──────────────────────────────────────────────────────────────────────
-API_BASE_URL: str = os.environ.get("API_BASE_URL", "")
-MODEL_NAME: str = os.environ.get("MODEL_NAME", "")
-HF_TOKEN: str = os.environ.get("HF_TOKEN", os.environ.get("API_KEY", ""))
+API_BASE_URL = os.environ.get("API_BASE_URL", "").strip()
+MODEL_NAME = os.environ.get("MODEL_NAME", "").strip()
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+API_KEY = HF_TOKEN or OPENAI_API_KEY or os.environ.get("API_KEY", "").strip()
 
-if not API_BASE_URL or not MODEL_NAME:
-    log.warning(
-        "API_BASE_URL and/or MODEL_NAME not set — "
-        "falling back to defaults for local testing."
-    )
-    API_BASE_URL = API_BASE_URL or "http://localhost:8000/v1"
-    MODEL_NAME = MODEL_NAME or "default-model"
+OPENENV_AGENT_MODE = os.environ.get("OPENENV_AGENT_MODE", "llm").strip().lower()
+OPENENV_EPISODES_PER_TASK = max(1, int(os.environ.get("OPENENV_EPISODES_PER_TASK", "1")))
+OPENENV_BASE_SEED = int(os.environ.get("OPENENV_BASE_SEED", "42"))
+OPENENV_REQUEST_TIMEOUT = float(os.environ.get("OPENENV_REQUEST_TIMEOUT", "60"))
+API_CALL_DELAY = max(0.0, float(os.environ.get("API_CALL_DELAY", "0")))
 
-client = OpenAI(
-    base_url=API_BASE_URL,
-    api_key=HF_TOKEN or "no-key",
-)
-
-# ──────────────────────────────────────────────────────────────────────
-# Fallback action (safe neutral position)
-# ──────────────────────────────────────────────────────────────────────
-FALLBACK_ACTION = Action(
+SAFE_FALLBACK_ACTION = Action(
     steam_valve=50.0,
     reflux_ratio=50.0,
     feed_rate=50.0,
     vent=0,
 )
 
-# ──────────────────────────────────────────────────────────────────────
-# System prompt — tailored to distillation-column control
-# ──────────────────────────────────────────────────────────────────────
-SYSTEM_PROMPT: str = textwrap.dedent("""\
-    You are an expert process-control AI operating a chemical distillation column.
 
-    ── OBSERVATION SPACE (what you receive each step) ───────────────────
-    • temperature  (float, °C)        — column temperature
-    • pressure     (float, bar)       — system pressure
-    • purity       (float, 0-100 %)   — product purity
-    • flow_rate    (float, L/min)     — throughput flow rate
-    • energy_usage (float, kWh)       — cumulative energy consumed
-    • time_step    (int)              — current simulation step
-
-    ── ACTION SPACE (what you must output) ──────────────────────────────
-    • steam_valve   (float, 0–100)  — steam valve opening %
-    • reflux_ratio  (float, 0–100)  — reflux ratio %
-    • feed_rate     (float, 0–100)  — feed rate %
-    • vent          (int,   0 or 1) — pressure-relief vent (0=closed, 1=open)
-
-    ── SAFETY LIMITS ────────────────────────────────────────────────────
-    • Pressure ≥ 2.8 bar → emergency shutdown (FAILURE)
-    • Temperature ≥ 145 °C → emergency shutdown (FAILURE)
-    • Keep pressure below ~2.0 bar and temperature near 85-115 °C.
-    • Open the vent (vent=1) when pressure rises above ~1.8 bar.
-
-    ── CONTROL STRATEGY GUIDELINES ──────────────────────────────────────
-    • For STABILIZATION: keep temperature near 100 °C. Use steam_valve ~45-55.
-    • For OPTIMIZATION: balance purity (raise reflux_ratio) with energy
-      efficiency (moderate steam_valve). Keep flow_rate moderate (~50-60).
-    • For EMERGENCY CONTROL: prioritise reducing pressure — open vent,
-      lower steam_valve (< 40), and moderate feed_rate. Once pressure
-      is below 1.5 bar, close vent and stabilise near 100 °C.
-
-    ── OUTPUT FORMAT ────────────────────────────────────────────────────
-    Respond with ONLY a JSON object on a single line. No explanation,
-    no markdown fences, no extra text.
-
-    Example:
-    {"steam_valve": 50.0, "reflux_ratio": 60.0, "feed_rate": 55.0, "vent": 0}
-""")
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Prompt helpers
-# ──────────────────────────────────────────────────────────────────────
-
-def build_user_prompt(
-    step: int,
-    observation: Observation,
-    task_name: str,
-    history: list[dict[str, Any]] | None = None,
-    reward_value: float | None = None,
-) -> str:
-    """Convert a simulation Observation into a readable user prompt."""
-    lines = [
-        f"Task: {task_name}",
-        f"Step: {step}",
-        "",
-        "Current Observation:",
-        f"  temperature  = {observation.temperature:.2f} °C",
-        f"  pressure     = {observation.pressure:.3f} bar",
-        f"  purity       = {observation.purity:.2f} %",
-        f"  flow_rate    = {observation.flow_rate:.2f} L/min",
-        f"  energy_usage = {observation.energy_usage:.2f} kWh",
-        f"  time_step    = {observation.time_step}",
-    ]
-
-    if reward_value is not None:
-        lines.append(f"\nLast reward: {reward_value:.4f}")
-
-    # Include a summary of recent history so the LLM can reason about trends
-    if history and len(history) >= 2:
-        prev = history[-2]
-        lines += [
-            "",
-            "Previous step observation:",
-            f"  temperature  = {prev['temperature']:.2f} °C",
-            f"  pressure     = {prev['pressure']:.3f} bar",
-            f"  purity       = {prev['purity']:.2f} %",
-            f"  flow_rate    = {prev['flow_rate']:.2f} L/min",
-        ]
-
-    lines.append("\nProvide your action as a JSON object:")
-    return "\n".join(lines)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Action parsing
-# ──────────────────────────────────────────────────────────────────────
-
-def parse_model_action(response_text: str) -> Action:
-    """Extract JSON from model response and parse into an Action.
-
-    Tries multiple extraction strategies:
-      1. Direct JSON parse of the full response
-      2. Regex extraction of {...}
-      3. Falls back to FALLBACK_ACTION on any failure
-    """
-    text = response_text.strip()
-
-    # Strategy 1: direct parse (model followed instructions perfectly)
-    try:
-        data = json.loads(text)
-        return _validate_action(data)
-    except (json.JSONDecodeError, Exception):
-        pass
-
-    # Strategy 2: extract first JSON object via regex
-    match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group())
-            return _validate_action(data)
-        except (json.JSONDecodeError, Exception):
-            pass
-
-    # Strategy 3: try to find JSON in markdown code fences
-    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fence_match:
-        try:
-            data = json.loads(fence_match.group(1))
-            return _validate_action(data)
-        except (json.JSONDecodeError, Exception):
-            pass
-
-    log.warning("Failed to parse action from LLM response, using fallback.")
-    log.debug("Raw response: %s", text[:300])
-    return FALLBACK_ACTION
-
-
-def _validate_action(data: dict) -> Action:
-    """Validate and clamp raw dict into a safe Action."""
-    return Action(
-        steam_valve=max(0.0, min(100.0, float(data.get("steam_valve", 50.0)))),
-        reflux_ratio=max(0.0, min(100.0, float(data.get("reflux_ratio", 50.0)))),
-        feed_rate=max(0.0, min(100.0, float(data.get("feed_rate", 50.0)))),
-        vent=1 if int(data.get("vent", 0)) == 1 else 0,
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────
-# LLM call helper
-# ──────────────────────────────────────────────────────────────────────
-
-# Delay between API calls (seconds). Set to 15 to stay under 5 RPM free-tier limits.
-API_CALL_DELAY: int = 15
-
-
-def call_llm(messages: list[dict[str, str]]) -> str:
-    """Send messages to the OpenAI-compatible endpoint and return the text."""
-    log.info("Waiting %ds to respect free-tier rate limits...", API_CALL_DELAY)
-    time.sleep(API_CALL_DELAY)
-    try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            max_tokens=256,
-            temperature=0.2,
+def resolve_agent_mode() -> str:
+    """Resolve the requested agent mode."""
+    if OPENENV_AGENT_MODE not in {"llm", "heuristic"}:
+        raise ValueError(
+            "OPENENV_AGENT_MODE must be one of: llm or heuristic."
         )
-        return response.choices[0].message.content or ""
-    except Exception as exc:
-        log.error("LLM call failed: %s", exc)
-        return ""
+    return OPENENV_AGENT_MODE
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Episode runner
-# ──────────────────────────────────────────────────────────────────────
+AGENT_MODE = resolve_agent_mode()
 
-def run_episode(task_name: str, seed: int = 42) -> dict[str, Any]:
-    """Run a single episode on the named task using the LLM agent.
 
-    Returns a dict with score-related info matching the grader schema.
-    """
-    task = get_task_by_name(task_name)
-    if task is None:
-        log.error("Unknown task: %s", task_name)
-        return {"error": f"Unknown task: {task_name}"}
-
-    env = DistillationEnv(seed=seed, max_steps=task.max_steps)
-    obs = task.reset(env)
-
-    messages: list[dict[str, str]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-    ]
-
-    history: list[dict[str, Any]] = [obs.model_dump()]
-    cumulative_reward: float = 0.0
-    reward_value: float | None = None
-    done = False
-    step = 0
-    info: dict[str, Any] = {}
-
-    log.info(
-        "▶ Starting episode  task=%s  seed=%d  max_steps=%d",
-        task_name, seed, task.max_steps,
-    )
-
-    while not done:
-        # Build prompt
-        user_prompt = build_user_prompt(
-            step=step,
-            observation=obs,
-            task_name=task_name,
-            history=history,
-            reward_value=reward_value,
+def build_client() -> OpenAI | None:
+    """Create the OpenAI-compatible client when running in LLM mode."""
+    if AGENT_MODE != "llm":
+        return None
+    if not API_BASE_URL:
+        raise RuntimeError("API_BASE_URL must be set when OPENENV_AGENT_MODE=llm.")
+    if not MODEL_NAME:
+        raise RuntimeError("MODEL_NAME must be set when OPENENV_AGENT_MODE=llm.")
+    if not API_KEY:
+        raise RuntimeError(
+            "HF_TOKEN or OPENAI_API_KEY must be set when OPENENV_AGENT_MODE=llm."
         )
-        messages.append({"role": "user", "content": user_prompt})
 
-        # Query LLM
-        raw_response = call_llm(messages)
-        action = parse_model_action(raw_response)
-
-        # Keep assistant message for conversational context
-        messages.append({"role": "assistant", "content": raw_response or "{}"})
-
-        # Step the environment
-        obs, reward, done, info = task.step(env, action)
-        cumulative_reward += reward.value
-        reward_value = reward.value
-        history.append(obs.model_dump())
-        step += 1
-
-        # Log progress periodically
-        if step % 10 == 0 or done:
-            log.info(
-                "  step=%3d  temp=%.1f  press=%.2f  purity=%.1f  reward=%.4f  cum=%.4f%s",
-                step,
-                obs.temperature,
-                obs.pressure,
-                obs.purity,
-                reward.value,
-                cumulative_reward,
-                "  [DONE]" if done else "",
-            )
-
-        # Trim context window to prevent token overflow (keep system + last 10 exchanges)
-        max_context_messages = 1 + 10 * 2  # system + 10 user/assistant pairs
-        if len(messages) > max_context_messages:
-            messages = [messages[0]] + messages[-(max_context_messages - 1):]
-
-    success = bool(info.get("task_success", False))
-    failed = bool(info.get("task_failed", False))
-    failure_reason = str(info.get("failure_reason", ""))
-
-    status = "✓ SUCCESS" if success else ("✗ FAILED" if failed else "— NEUTRAL")
-    log.info(
-        "■ Episode finished  task=%s  status=%s  steps=%d  cumulative_reward=%.4f%s",
-        task_name,
-        status,
-        step,
-        cumulative_reward,
-        f"  reason={failure_reason}" if failure_reason else "",
+    return OpenAI(
+        base_url=API_BASE_URL,
+        api_key=API_KEY,
+        timeout=OPENENV_REQUEST_TIMEOUT,
     )
 
+
+CLIENT = build_client()
+
+
+def compact_action(action: Action) -> dict[str, Any]:
+    """Return a stable action payload for logs."""
     return {
-        "task": task_name,
-        "seed": seed,
-        "steps": step,
-        "cumulative_reward": cumulative_reward,
-        "success": success,
-        "failed": failed,
-        "failure_reason": failure_reason,
-        "final_observation": obs.model_dump(),
+        "steam_valve": round(action.steam_valve, 4),
+        "reflux_ratio": round(action.reflux_ratio, 4),
+        "feed_rate": round(action.feed_rate, 4),
+        "vent": int(action.vent),
     }
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Main entry point
-# ──────────────────────────────────────────────────────────────────────
+def compact_observation(observation: Observation) -> dict[str, Any]:
+    """Return a stable observation payload for logs."""
+    return {
+        "temperature": round(observation.temperature, 4),
+        "pressure": round(observation.pressure, 4),
+        "purity": round(observation.purity, 4),
+        "flow_rate": round(observation.flow_rate, 4),
+        "energy_usage": round(observation.energy_usage, 4),
+        "time_step": int(observation.time_step),
+    }
+
+
+def compact_state(state: EnvironmentState) -> dict[str, Any]:
+    """Return a stable state payload for prompts."""
+    return {
+        "active_task": state.active_task,
+        "temperature": round(state.temperature, 4),
+        "pressure": round(state.pressure, 4),
+        "purity": round(state.purity, 4),
+        "flow_rate": round(state.flow_rate, 4),
+        "energy_usage": round(state.energy_usage, 4),
+        "time_step": int(state.time_step),
+        "hidden_instability": round(state.hidden_instability, 4),
+        "cooling_failure": bool(state.cooling_failure),
+        "pressure_spike": bool(state.pressure_spike),
+        "prev_action": (
+            compact_action(state.prev_action) if state.prev_action is not None else None
+        ),
+    }
+
+
+def build_system_prompt(task_name: str, task_description: str) -> str:
+    """Build the fixed system prompt for the LLM controller."""
+    return "\n".join(
+        [
+            "You are controlling a distillation column in a step-by-step simulation.",
+            "Follow the user's control instructions exactly.",
+            "Output strict JSON only.",
+        ]
+    )
+
+
+def build_user_prompt(
+    observation: Observation,
+    state: EnvironmentState,
+    last_reward: float | None,
+) -> str:
+    """Build the step prompt from the current observation and state."""
+    return f"""You are controlling a distillation column in a step-by-step simulation.
+
+You MUST adapt your actions based on the current state. Repeating the same action across steps is NOT allowed unless the state is unchanged.
+
+CURRENT STATE:
+
+* Temperature: {observation.temperature:.4f}
+* Pressure: {observation.pressure:.4f}
+* Purity: {observation.purity:.4f}
+* Flow rate: {observation.flow_rate:.4f}
+
+CONTROL OBJECTIVES:
+
+* Keep temperature near 90
+* Keep pressure below 2.5 (CRITICAL: vent if high)
+* Increase purity above 60
+* Maintain stable operation
+
+CONTROL RULES (IMPORTANT):
+
+* If pressure > 2.2 -> set vent = 1 and reduce steam
+* If temperature > 95 -> decrease steam
+* If temperature < 85 -> increase steam
+* If purity < 55 -> increase reflux
+* If purity > 65 -> reduce reflux
+* If flow_rate too low -> increase feed
+* If pressure rising -> reduce feed
+
+ANTI-LAZY RULE:
+
+* Do NOT repeat identical actions across steps if the state has changed
+* Adjust at least one control variable every step
+
+OUTPUT FORMAT (STRICT JSON ONLY):
+{{
+"steam_valve": number (0-100),
+"reflux_ratio": number (0-100),
+"feed_rate": number (0-100),
+"vent": 0 or 1
+}}
+
+NO explanations. NO text. ONLY JSON."""
+
+
+def parse_model_action(response_text: str, fallback_action: Action) -> Action:
+    """Parse the model response into a validated Action."""
+    text = response_text.strip()
+
+    try:
+        return Action.model_validate_json(text)
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return Action.model_validate_json(match.group(0))
+        except Exception:
+            pass
+
+    return fallback_action
+
+
+def choose_action_with_llm(
+    task_name: str,
+    task_description: str,
+    observation: Observation,
+    state: EnvironmentState,
+    last_reward: float | None,
+) -> Action:
+    """Query the configured LLM for the next action."""
+    if CLIENT is None:
+        raise RuntimeError("LLM mode requested without an initialized client.")
+
+    if API_CALL_DELAY > 0:
+        time.sleep(API_CALL_DELAY)
+
+    response_text = ""
+    try:
+        response = CLIENT.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": build_system_prompt(task_name, task_description)},
+                {
+                    "role": "user",
+                    "content": build_user_prompt(
+                        observation=observation,
+                        state=state,
+                        last_reward=last_reward,
+                    ),
+                },
+            ],
+            max_tokens=128,
+            temperature=0.0,
+        )
+        response_text = response.choices[0].message.content or ""
+    except Exception:
+        return SAFE_FALLBACK_ACTION
+
+    return parse_model_action(
+        response_text=response_text,
+        fallback_action=SAFE_FALLBACK_ACTION,
+    )
+
+
+def choose_action(
+    task_name: str,
+    task_description: str,
+    observation: Observation,
+    state: EnvironmentState,
+    last_reward: float | None,
+) -> Action:
+    """Choose the next action using the configured agent mode."""
+    if AGENT_MODE == "heuristic":
+        # Explicit offline/debug mode only. Submission mode should use `llm`.
+        steam_valve = max(30.0, min(70.0, 50.0 + (90.0 - observation.temperature)))
+        vent = 1 if observation.pressure > 2.0 else 0
+        return Action(
+            steam_valve=steam_valve,
+            reflux_ratio=50.0,
+            feed_rate=50.0,
+            vent=vent,
+        )
+    return choose_action_with_llm(
+        task_name=task_name,
+        task_description=task_description,
+        observation=observation,
+        state=state,
+        last_reward=last_reward,
+    )
+
+
+def run_episode(task_name: str, episode_index: int, seed: int) -> dict[str, Any]:
+    """Run one deterministic episode and emit structured logs."""
+    task = get_task_by_name(task_name)
+    if task is None:
+        raise ValueError(f"Unknown task '{task_name}'.")
+
+    runtime = OpenEnvRuntime()
+    observation = runtime.reset(task_name=task_name, seed=seed)
+    last_reward: float | None = None
+    cumulative_reward = 0.0
+    reward_values: list[float] = []
+    done = False
+    step_count = 0
+    info: dict[str, Any] = {
+        "task_success": False,
+        "task_failed": False,
+        "failure_reason": "",
+        "step_count": 0,
+    }
+
+    model_name = MODEL_NAME if AGENT_MODE == "llm" else "heuristic-baseline"
+    print(f"[START] task={task_name} env=openenv model={model_name}", flush=True)
+
+    while not done:
+        state = runtime.state()
+        action = choose_action(
+            task_name=task_name,
+            task_description=task.description,
+            observation=observation,
+            state=state,
+            last_reward=last_reward,
+        )
+        observation, reward, done, info = runtime.step(action)
+        cumulative_reward += reward.value
+        reward_values.append(reward.value)
+        last_reward = reward.value
+        step_count += 1
+
+        action_str = (
+            f"steam={action.steam_valve:.4f},"
+            f"reflux={action.reflux_ratio:.4f},"
+            f"feed={action.feed_rate:.4f},"
+            f"vent={int(action.vent)}"
+        )
+        done_str = str(bool(done)).lower()
+        print(
+            f"[STEP] step={step_count} action={action_str} "
+            f"reward={reward.value:.2f} done={done_str} error=null",
+            flush=True,
+        )
+
+    score = compute_episode_score(
+        cumulative_reward=cumulative_reward,
+        success=bool(info.get("task_success", False)),
+        failed=bool(info.get("task_failed", False)),
+        steps=step_count,
+        max_steps=task.max_steps,
+    )
+
+    result = {
+        "task": task_name,
+        "episode": episode_index + 1,
+        "seed": seed,
+        "steps": step_count,
+        "success": bool(info.get("task_success", False)),
+        "failed": bool(info.get("task_failed", False)),
+        "failure_reason": str(info.get("failure_reason", "")),
+        "cumulative_reward": cumulative_reward,
+        "score": score,
+        "final_observation": compact_observation(observation),
+    }
+
+    success = str(bool(info.get("task_success", False))).lower()
+    reward_list = ",".join(f"{reward_value:.2f}" for reward_value in reward_values)
+    print(f"[END] success={success} steps={step_count} rewards={reward_list}", flush=True)
+    return result
+
+
+def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-episode results into task scores and an overall score."""
+    task_scores: dict[str, float] = {}
+
+    for task_name in [task.name for task in get_all_tasks()]:
+        task_results = [result for result in results if result["task"] == task_name]
+        if not task_results:
+            continue
+        task_scores[task_name] = sum(result["score"] for result in task_results) / len(task_results)
+
+    total_weight = sum(TASK_WEIGHTS[name] for name in task_scores)
+    weighted_total = sum(task_scores[name] * TASK_WEIGHTS[name] for name in task_scores)
+    overall_score = weighted_total / total_weight if total_weight > 0 else 0.0
+
+    return {
+        "kind": "summary",
+        "mode": AGENT_MODE,
+        "model": MODEL_NAME if AGENT_MODE == "llm" else "heuristic-baseline",
+        "episodes_per_task": OPENENV_EPISODES_PER_TASK,
+        "overall_score": round(overall_score, 6),
+        "task_scores": {name: round(score, 6) for name, score in task_scores.items()},
+    }
+
 
 def main() -> None:
-    """Run the LLM agent across all three tasks and report results."""
-    log.info("=" * 70)
-    log.info("OpenEnv LLM Inference — Hackathon Submission")
-    log.info("=" * 70)
-    log.info("API_BASE_URL : %s", API_BASE_URL)
-    log.info("MODEL_NAME   : %s", MODEL_NAME)
-    log.info("HF_TOKEN     : %s", "***" if HF_TOKEN else "(not set)")
-    log.info("")
+    """Run the configured controller across all tasks."""
+    all_results: list[dict[str, Any]] = []
+    ordered_tasks = [task.name for task in get_all_tasks()]
 
-    task_names = ["stabilization", "optimization", "emergency_control"]
-    n_episodes = 3  # episodes per task (increase for full evaluation)
-    all_results: dict[str, list[dict[str, Any]]] = {}
-
-    for task_name in task_names:
-        log.info("━" * 70)
-        log.info("TASK: %s", task_name.upper())
-        log.info("━" * 70)
-
-        results: list[dict[str, Any]] = []
-        for ep in range(n_episodes):
-            seed = ep * 1000 + 42
-            result = run_episode(task_name, seed=seed)
-            results.append(result)
-
-        all_results[task_name] = results
-
-        # Summary
-        successes = sum(1 for r in results if r.get("success"))
-        failures = sum(1 for r in results if r.get("failed"))
-        avg_reward = sum(r.get("cumulative_reward", 0) for r in results) / len(results)
-        avg_steps = sum(r.get("steps", 0) for r in results) / len(results)
-
-        log.info(
-            "  Summary: %d/%d success, %d/%d failed, "
-            "avg_reward=%.4f, avg_steps=%.1f",
-            successes, n_episodes,
-            failures, n_episodes,
-            avg_reward,
-            avg_steps,
-        )
-
-    # Final summary
-    log.info("")
-    log.info("=" * 70)
-    log.info("FINAL RESULTS")
-    log.info("=" * 70)
-    for task_name, results in all_results.items():
-        successes = sum(1 for r in results if r.get("success"))
-        avg_reward = sum(r.get("cumulative_reward", 0) for r in results) / len(results)
-        log.info(
-            "  %-20s  success=%d/%d  avg_reward=%.4f",
-            task_name, successes, n_episodes, avg_reward,
-        )
-    log.info("=" * 70)
+    for task_index, task_name in enumerate(ordered_tasks):
+        for episode_index in range(OPENENV_EPISODES_PER_TASK):
+            seed = OPENENV_BASE_SEED + task_index * 10_000 + episode_index
+            all_results.append(
+                run_episode(
+                    task_name=task_name,
+                    episode_index=episode_index,
+                    seed=seed,
+                )
+            )
 
 
 if __name__ == "__main__":
