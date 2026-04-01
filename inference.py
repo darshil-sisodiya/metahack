@@ -338,11 +338,13 @@ def choose_action_with_llm(
             response_format=Action,
         )
     except Exception as exc:
-        raise RuntimeError(f"LLM request failed: {exc}") from exc
+        print(f"Warning: LLM returned invalid action ({exc}). Using neutral fallback.", flush=True)
+        return Action(steam_valve=50.0, reflux_ratio=50.0, feed_rate=50.0, vent=0)
 
     parsed = response.choices[0].message.parsed
     if parsed is None:
-        raise ValueError("Model response did not contain a parsed Action payload.")
+        print("Warning: Model response did not contain a parsed Action. Using neutral fallback.", flush=True)
+        return Action(steam_valve=50.0, reflux_ratio=50.0, feed_rate=50.0, vent=0)
     return parsed
 
 
