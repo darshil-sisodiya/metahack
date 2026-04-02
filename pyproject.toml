@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metahack-openenv-submission"
+version = "1.0.0"
+description = "Meta X Scaler Hackathon OpenEnv Submission: Chemical Distillation Plant"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "openai",
+    "python-dotenv",
+    "openenv-core"
+]
+
+[project.scripts]
+server = "server.app:main"

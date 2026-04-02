@@ -93,3 +93,13 @@ async def state_env() -> EnvironmentState:
         return runtime.state()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def main():
+    """Entry point for the OpenEnv validation script."""
+    import uvicorn
+    # 0.0.0.0 is strictly required for Hugging Face Spaces
+    uvicorn.run("server.app:app", host="0.0.0.0", port=7860, reload=True)
+
+if __name__ == "__main__":
+    main()
