@@ -1,355 +1,433 @@
----
-title: OpenEnv Distillation Control
-sdk: docker
-app_port: 7860
-pinned: false
-colorFrom: blue
-colorTo: green
-tags:
-  - openenv
-  - industrial-control
-  - fastapi
+# OpenEnv — Distillation Column Control Benchmark
+
+> **Meta × Scaler Hackathon Submission** — An LLM-driven agent that controls a simulated industrial distillation column across three progressively harder tasks.
+
+OpenEnv is a lightweight process-control benchmark built around a physics-inspired distillation column simulator. An LLM agent receives real-time plant observations (temperature, pressure, purity, flow rate) and must return control actions (steam valve, reflux ratio, feed rate, vent) to keep the system stable, efficient, and safe.
+
 ---
 
-# OpenEnv Distillation Control
+## Table of Contents
 
-OpenEnv Distillation Control is a real-world industrial process-operations benchmark.
-It simulates the task of operating a chemical distillation column: keeping the plant
-stable, balancing throughput against purity and energy cost, and recovering from
-dangerous pressure conditions.
+- [Quick Start](#quick-start)
+- [Deployment on Hugging Face Spaces](#deployment-on-hugging-face-spaces)
+- [Running the LLM Inference Script](#running-the-llm-inference-script)
+- [Environment Variables](#environment-variables)
+- [Repository Layout](#repository-layout)
+- [Architecture Overview](#architecture-overview)
+- [API Endpoints](#api-endpoints)
+- [Tasks](#tasks)
+- [Scoring System](#scoring-system)
+- [Configuration via openenv.yaml](#configuration-via-openenvyaml)
+- [Validation](#validation)
+- [Helper Scripts](#helper-scripts)
+- [Heuristic Baseline Results](#heuristic-baseline-results)
 
-The project exposes the standard OpenEnv interaction surface through typed
-`reset()`, `step()`, and `state()` APIs, plus matching FastAPI endpoints for
-containerized deployment.
+---
 
-## Why This Is A Real-World Task
+## Quick Start
 
-Human operators and control engineers perform exactly this class of work:
+### Prerequisites
 
-- hold process variables near safe operating targets
-- balance output quality, throughput, and energy use
-- respond to escalating safety conditions under delayed dynamics
-- recover equipment from abnormal pressure states without causing shutdowns
+- Python 3.11+
+- Docker (for container builds and HuggingFace deployment)
+- An OpenAI-compatible API key (HuggingFace, Gemini, OpenAI, or local vLLM/LM Studio)
 
-This benchmark is not a game and not a toy workflow. It models industrial
-process control and safety decision-making.
-
-## Environment Overview
-
-The repo is organized into two layers:
-
-- `app/env.py`: the physics-inspired process simulator
-- `app/runtime.py`: the OpenEnv runtime that turns the simulator into a task-aware
-  `reset/step/state` environment with typed rewards and state
-
-Supporting files:
-
-- `app/models.py`: typed Pydantic models for observation, action, reward, and state
-- `app/tasks.py`: three graded tasks with increasing difficulty
-- `app/grader.py`: deterministic 0.0-1.0 scoring
-- `app/baseline.py`: deterministic heuristic baseline
-- `app/main.py`: FastAPI app exposing the OpenEnv HTTP API
-- `inference.py`: root submission script with structured stdout logging
-- `openenv.yaml`: environment metadata and endpoint/task declarations
-
-## API Surface
-
-The environment supports both in-process Python usage and HTTP usage.
-
-### Python API
-
-```python
-from app.models import Action
-from app.runtime import OpenEnvRuntime
-
-runtime = OpenEnvRuntime()
-obs = runtime.reset(task_name="optimization", seed=42)
-state = runtime.state()
-obs, reward, done, info = runtime.step(
-    Action(steam_valve=50, reflux_ratio=50, feed_rate=50, vent=0)
-)
-```
-
-### HTTP API
-
-- `GET /health` -> health check
-- `POST /reset` -> returns initial `Observation`
-- `POST /step` -> returns `StepResponse` with typed `Reward`
-- `GET /state` and `POST /state` -> returns full typed `EnvironmentState`
-
-Example:
+### 1. Clone and install
 
 ```bash
-curl -X POST http://127.0.0.1:7860/reset \
-  -H "Content-Type: application/json" \
-  -d "{\"task_name\":\"optimization\",\"seed\":42}"
+git clone https://huggingface.co/spaces/Tushar-Projects/MetaHackathon
+cd MetaHackathon
 
-curl -X POST http://127.0.0.1:7860/step \
-  -H "Content-Type: application/json" \
-  -d "{\"steam_valve\":50,\"reflux_ratio\":50,\"feed_rate\":50,\"vent\":0}"
+python -m venv venv
+source venv/bin/activate        # Linux/Mac
+venv\Scripts\activate           # Windows
 
-curl http://127.0.0.1:7860/state
-```
-
-## Observation, Action, Reward, And State
-
-### Observation
-
-The observation returned by `reset()` and `step()` contains:
-
-- `temperature`
-- `pressure`
-- `purity`
-- `flow_rate`
-- `energy_usage`
-- `time_step`
-
-### Action
-
-The controller must emit:
-
-- `steam_valve`: float in `[0, 100]`
-- `reflux_ratio`: float in `[0, 100]`
-- `feed_rate`: float in `[0, 100]`
-- `vent`: integer `0` or `1`
-
-### Reward
-
-`step()` returns a typed `Reward` model:
-
-- `value`: scalar reward used by the grader
-- `components`: reward breakdown for partial-progress signals and penalties
-
-### State
-
-`state()` returns the full typed `EnvironmentState`, including:
-
-- the active task name
-- current process variables
-- latent instability and fault flags
-- the previous action
-
-## Tasks And Difficulty
-
-The benchmark includes three tasks with explicit easy -> medium -> hard difficulty.
-
-### 1. Stabilization
-
-Difficulty: easy
-
-Goal:
-
-- keep temperature near 100 C
-- keep pressure safely below shutdown thresholds
-- finish with low oscillation
-
-Why it is easy:
-
-- no instability escalation
-- forgiving initial conditions
-- success is mostly about steady control
-
-### 2. Optimization
-
-Difficulty: medium
-
-Goal:
-
-- improve purity
-- maintain usable throughput
-- avoid wasting energy
-
-Why it is medium:
-
-- instability can escalate into pressure growth
-- poor purity over many steps causes failure
-- reward must balance multiple competing objectives
-
-### 3. Emergency Control
-
-Difficulty: hard
-
-Goal:
-
-- recover from elevated pressure
-- handle delayed cooling behavior
-- maintain enough stability to avoid runaway failure
-
-Why it is hard:
-
-- starts closer to dangerous operating conditions
-- adds delayed and weakened cooling response
-- requires deliberate vent use and recovery planning
-
-## Reward Design
-
-Rewards provide trajectory-level signal rather than only end-of-episode success.
-
-- `Stabilization`: rewards target temperature and safe pressure, penalizes variance
-- `Optimization`: rewards purity and throughput, penalizes energy use and sustained instability
-- `Emergency Control`: rewards pressure reduction and recovery, penalizes escalation
-
-Each task also includes interpretable reward components in the returned
-`Reward.components` field so partial progress is visible at every step.
-
-## Deterministic Grading
-
-`app/grader.py` evaluates all tasks with deterministic seeds and returns normalized
-scores in the required `0.0-1.0` range.
-
-- `evaluate_episode(...)` returns a single-task normalized score
-- `evaluate_all_tasks(...)` returns:
-  - `overall_score`
-  - `task_scores`
-  - `details`
-
-## Baseline Results
-
-Current deterministic baseline results from `python -m app.baseline`:
-
-| Metric | Score |
-| --- | --- |
-| Overall score | `0.619` |
-| Stabilization | `0.812` |
-| Optimization | `0.715` |
-| Emergency control | `0.414` |
-
-Success rates from the same run:
-
-- stabilization: `100.0%`
-- optimization: `77.0%`
-- emergency_control: `0.0%`
-
-These are intended as a reproducible reference point, not a learned upper bound.
-
-## Inference Script
-
-The required root-level submission script is `inference.py`.
-
-Submission behavior:
-
-- uses the OpenAI-compatible Python client in LLM mode
-- reads environment variables from `.env` or the process environment
-- runs deterministic seeded episodes on all three tasks
-- emits strict stdout logs with one `[START]`, many `[STEP]`, and one `[END]` per episode
-- adapts actions step by step from the current process state
-
-Environment variables:
-
-- `API_BASE_URL`
-- `MODEL_NAME`
-- `HF_TOKEN`
-- `OPENAI_API_KEY` (optional compatibility fallback)
-- `OPENENV_AGENT_MODE` (`llm` or `heuristic`)
-- `OPENENV_EPISODES_PER_TASK`
-- `OPENENV_BASE_SEED`
-- `API_CALL_DELAY`
-
-Local offline smoke test:
-
-```bash
-$env:OPENENV_AGENT_MODE="heuristic"
-python inference.py
-```
-
-Submission-mode run:
-
-```bash
-python inference.py
-```
-
-`inference.py` defaults to `OPENENV_AGENT_MODE=llm` and will fail fast if
-`API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN`/`OPENAI_API_KEY` are missing.
-
-The default configuration is one deterministic episode per task so runtime stays
-well within the 20-minute infrastructure limit on a modest CPU machine.
-
-Episode log format:
-
-```text
-[START] task=<task_name> env=openenv model=<model_name>
-[STEP] step=<n> action=steam=<val>,reflux=<val>,feed=<val>,vent=<val> reward=<0.00> done=<true|false> error=null
-[END] success=<true|false> steps=<n> rewards=<r1,r2,...,rn>
-```
-
-The LLM prompt is state-aware and instructs the model to:
-
-- keep temperature near 90
-- vent and reduce steam when pressure becomes unsafe
-- raise reflux when purity is too low
-- avoid repeating identical actions when the state has changed
-
-## Setup
-
-### Install Dependencies
-
-```bash
 pip install -r requirements.txt
 ```
 
-### Run The API Locally
+### 2. Configure environment variables
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 7860
+cp .env.example .env
 ```
 
-### Run The Baseline
+Edit `.env` and fill in your real credentials:
+
+```env
+API_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"
+MODEL_NAME="gemini-2.5-flash"
+HF_TOKEN="your-actual-api-key"
+```
+
+> **Security:** `.env` is listed in `.gitignore` — your secrets will never be committed.
+
+### 3. Run the API server locally
+
+```bash
+uvicorn server.app:app --host 0.0.0.0 --port 7860 --reload
+```
+
+The server exposes the OpenEnv environment as a REST API at `http://localhost:7860`.
+
+### 4. Run the LLM inference agent
+
+```bash
+python inference.py
+```
+
+This runs the LLM agent across all three tasks and emits structured `[START]`/`[STEP]`/`[END]` logs with per-task and overall scores.
+
+### 5. Run the heuristic baseline (no LLM needed)
 
 ```bash
 python -m app.baseline
 ```
 
-### Run The Task-Difficulty Probe
+---
+
+## Deployment on Hugging Face Spaces
+
+This project is deployed as a Docker-based HuggingFace Space. The Space serves the OpenEnv API so the hackathon evaluator can call `/reset`, `/step`, and `/state` remotely.
+
+### Deploying to your own HF Space
+
+**Step 1: Create a Docker Space on Hugging Face**
+
+Go to [huggingface.co/new-space](https://huggingface.co/new-space) and create a new Space with **SDK: Docker**.
+
+**Step 2: Add the HF Space as a git remote**
+
+```bash
+git remote add hf https://huggingface.co/spaces/<YOUR-USERNAME>/<YOUR-SPACE-NAME>
+```
+
+**Step 3: Push your code**
+
+```bash
+git push hf HEAD:main
+```
+
+HuggingFace will automatically build the Docker image and start the server. Wait 2-3 minutes for the build to complete.
+
+**Step 4: Verify the deployment**
+
+```bash
+# Health check
+curl https://<your-space>.hf.space/health
+# Expected: {"status":"ok"}
+
+# Reset the environment
+curl -X POST https://<your-space>.hf.space/reset \
+  -H "Content-Type: application/json" \
+  -d '{"task_name": "stabilization", "seed": 42}'
+
+# Step the environment
+curl -X POST https://<your-space>.hf.space/step \
+  -H "Content-Type: application/json" \
+  -d '{"steam_valve": 50, "reflux_ratio": 50, "feed_rate": 50, "vent": 0}'
+```
+
+### Building and running with Docker locally
+
+```bash
+# Build the image
+docker build -t openenv .
+
+# Run the container
+docker run -p 7860:7860 openenv
+```
+
+The server will be available at `http://localhost:7860`.
+
+> **Note:** The Dockerfile creates a non-root `user` (UID 1000) as required by Hugging Face Spaces, and the `CMD` points to `server.app:app` on port `7860`.
+
+---
+
+## Running the LLM Inference Script
+
+`inference.py` is the **mandatory hackathon submission entry point**. It uses the OpenAI-compatible Python client to drive an LLM agent through all three OpenEnv tasks.
+
+### How it works
+
+1. Loads environment variables from `.env` via `python-dotenv`
+2. Initializes an OpenAI client pointed at the configured API endpoint
+3. For each task, runs seeded episodes:
+   - Builds a compact prompt from the current `Observation` (state + rolling 3-step history + static control hierarchy)
+   - Sends it to the LLM via `CLIENT.beta.chat.completions.parse` with `response_format=Action`
+   - Validates the response against Pydantic constraints (with graceful fallback on out-of-bounds values)
+   - Steps the environment via the runtime and logs the result
+
+### Running
+
+```bash
+# Make sure .env is configured, then:
+python inference.py
+```
+
+### Output format
+
+The script emits structured logs compatible with the hackathon evaluator:
+
+```
+[START] task=stabilization env=openenv model=gemini-2.5-flash
+[STEP] step=1 action=steam=45.0000,reflux=55.0000,feed=50.0000,vent=0 reward=0.77 done=false error=null
+[STEP] step=2 action=steam=42.0000,reflux=58.0000,feed=48.0000,vent=0 reward=0.78 done=false error=null
+...
+[END] success=true steps=50 rewards=0.77,0.78,...
+```
+
+### Rate limiting
+
+Free-tier APIs enforce strict rate limits. The script has a configurable delay:
+
+```env
+# In your .env file:
+API_CALL_DELAY="15"   # seconds between API calls (0 for paid tiers)
+```
+
+| Scenario | Recommended `API_CALL_DELAY` |
+| --- | --- |
+| **Free-tier Gemini** (5 RPM) | `15` |
+| **Paid OpenAI / vLLM** | `0` |
+| **HuggingFace Inference API** | `5`–`10` |
+
+---
+
+## Environment Variables
+
+All configuration is via environment variables loaded from `.env`:
+
+| Variable | Required | Description | Example |
+| --- | --- | --- | --- |
+| `API_BASE_URL` | Yes | OpenAI-compatible API endpoint | `https://generativelanguage.googleapis.com/v1beta/openai/` |
+| `MODEL_NAME` | Yes | Model identifier | `gemini-2.5-flash` |
+| `HF_TOKEN` | Yes | API key (also reads `OPENAI_API_KEY`, `API_KEY` as fallbacks) | `your-api-key` |
+| `API_CALL_DELAY` | No | Seconds between LLM calls (default `0`) | `15` |
+| `OPENENV_EPISODES_PER_TASK` | No | Episodes per task (default `1`) | `1` |
+| `OPENENV_BASE_SEED` | No | Base random seed (default `42`) | `42` |
+| `OPENENV_REQUEST_TIMEOUT` | No | HTTP timeout in seconds (default `60`) | `60` |
+
+---
+
+## Repository Layout
+
+```
+metahack/
+├── inference.py              # Hackathon LLM inference entry point
+├── server/
+│   └── app.py                # FastAPI server (HF Spaces entry point)
+├── app/
+│   ├── __init__.py            # Package marker
+│   ├── models.py              # Pydantic models: Observation, Action, Reward
+│   ├── env.py                 # Physics simulator (DistillationEnv)
+│   ├── tasks.py               # Task wrappers: reward, success, failure logic
+│   ├── grader.py              # Scoring engine (0-100 scores)
+│   ├── baseline.py            # Hand-tuned heuristic controller
+│   ├── config.py              # YAML configuration loader
+│   └── runtime.py             # OpenEnvRuntime (unified env+task manager)
+├── openenv.yaml               # Task parameters (loaded at runtime)
+├── Dockerfile                 # Container image for HF Spaces
+├── pyproject.toml             # Python project metadata
+├── requirements.txt           # pip dependencies
+├── validate.sh                # Pre-submission validation script
+├── .env.example               # Environment variable template
+├── .gitignore                 # Protects .env from commits
+├── test.py                    # Random-policy difficulty probe
+└── test_grader.py             # Grader smoke test
+```
+
+---
+
+## Architecture Overview
+
+```
+┌──────────────┐   Observation   ┌──────────────┐   task.step()   ┌──────────────┐
+│   LLM Agent  │ ◄──────────── │    Task       │ ◄──────────── │  Distillation │
+│ (inference.py│ ──────────────►│  (tasks.py)   │ ──────────────►│  Env (env.py) │
+└──────────────┘    Action       └──────────────┘                └──────────────┘
+                                       │
+                                       ▼
+                                ┌──────────────┐
+                                │   Grader      │
+                                │ (grader.py)   │
+                                └──────────────┘
+```
+
+1. The agent receives an `Observation` (temperature, pressure, purity, flow rate, energy, time step)
+2. The agent returns an `Action` (steam_valve, reflux_ratio, feed_rate, vent)
+3. The `Task` applies the action through `task.step(env, action)`
+4. The `DistillationEnv` advances the physical state with delayed dynamics, noise, and faults
+5. The task computes reward, checks success/failure, and applies escalation logic
+6. The `Grader` converts the full episode into a 0–100 score
+
+---
+
+## API Endpoints
+
+The FastAPI server (`server/app.py`) exposes these endpoints:
+
+| Method | Path | Description | Request Body | Response |
+| --- | --- | --- | --- | --- |
+| `GET` | `/` | Root health check | — | `{"status": "ok"}` |
+| `GET` | `/health` | Health check | — | `{"status": "ok"}` |
+| `POST` | `/reset` | Reset environment with a task | `{"task_name": "stabilization", "seed": 42}` | `Observation` |
+| `POST` | `/step` | Advance one step | `{"steam_valve": 50, "reflux_ratio": 50, "feed_rate": 50, "vent": 0}` | `{observation, reward, done, info}` |
+| `GET/POST` | `/state` | Get current environment state | — | `EnvironmentState` |
+
+---
+
+## Tasks
+
+The benchmark includes three tasks of increasing difficulty:
+
+### Task 1: Stabilization (Easy)
+
+- **Goal:** Hold the plant near 100°C with low oscillation and safe pressure
+- **Max steps:** 50
+- **Success:** `|temperature - 100| < 15` and `temperature_variance < 10` at episode end
+- **Failure:** Temperature out of `[50, 140]` or safety shutdown
+
+### Task 2: Optimization (Medium)
+
+- **Goal:** Balance purity, throughput, and energy efficiency
+- **Max steps:** 75
+- **Success:** `purity >= 57.5`, `flow_rate >= 12`, and `temperature_variance < 30` at episode end
+- **Failure:** Low purity for 30+ steps, 5+ instability steps, or safety shutdown
+- **Escalation:** Pressure increases by 10% per step after 3 consecutive unstable steps
+
+### Task 3: Emergency Control (Hard)
+
+- **Goal:** Recover from an elevated-pressure starting state
+- **Max steps:** 60
+- **Success:** Maintain stability for 8+ consecutive steps
+- **Failure:** Pressure ≥ 3.2, timeout without recovery, or safety shutdown
+- **Escalation:** Pressure grows by 4% after 5 unstable steps, plus 3% cascading above pressure 2.6
+- **Extra difficulty:** Delayed cooling response, reduced cooling effectiveness
+
+### Task weights
+
+| Task | Weight |
+| --- | --- |
+| Stabilization | `0.25` |
+| Optimization | `0.35` |
+| Emergency Control | `0.40` |
+
+---
+
+## Scoring System
+
+Each episode produces a 0–100 score:
+
+```
+performance_score = map(clip(cumulative_reward / max_steps, -1, 1), [-1,1], [0,60])
+success_bonus     = 40 if task_success else 0
+efficiency_bonus  = ((max_steps - steps) / max_steps) * 10  (only on success)
+failure_cap       = min(score, 30 + performance_score * 0.5) (only on failure)
+final_score       = clip(total, 0, 100)
+```
+
+The overall score is a weighted average across all tasks.
+
+---
+
+## Configuration via openenv.yaml
+
+All task parameters are stored in `openenv.yaml` and loaded at runtime by `app/config.py`. Any parameter present in the YAML overrides the Python-level default. Removing a key causes the code to fall back to its built-in default.
+
+Example — change the stabilization target temperature:
+
+```yaml
+tasks:
+  - name: stabilization
+    parameters:
+      target_temperature: 95.0    # was 100.0
+      max_steps: 60               # was 50
+```
+
+No code changes required — restart the server and the new values take effect.
+
+---
+
+## Validation
+
+A pre-submission validation script checks that your deployment is ready:
+
+```bash
+# Make the script executable (first time only)
+chmod +x validate.sh
+
+# Run validation against your HF Space
+./validate.sh https://<your-space>.hf.space
+```
+
+The validator performs 3 checks:
+
+1. **Ping test** — Calls `POST /reset` on your HF Space and expects HTTP 200
+2. **Docker build** — Builds the Dockerfile locally to ensure it compiles
+3. **OpenEnv validate** — Runs `openenv validate` to check the project structure
+
+```
+========================================
+  OpenEnv Submission Validator
+========================================
+[18:14:17] PASSED -- HF Space is live and responds to /reset
+[18:15:55] PASSED -- Docker build succeeded
+[18:15:58] PASSED -- openenv validate passed
+
+========================================
+  All 3/3 checks passed!
+  Your submission is ready to submit.
+========================================
+```
+
+---
+
+## Helper Scripts
+
+### `test.py` — Task difficulty probe
+
+Runs 200 episodes per task with seeded random actions to measure survivability:
 
 ```bash
 python test.py
 ```
 
-## Docker
+### `test_grader.py` — Grader smoke test
 
-Build:
-
-```bash
-docker build -t openenv-distillation-control .
-```
-
-Run:
+Compares a dumb agent, a random agent, and the heuristic agent through the grading pipeline:
 
 ```bash
-docker run -p 7860:7860 openenv-distillation-control
+python test_grader.py
 ```
 
-The container entrypoint serves the FastAPI app on port `7860`.
+### `app.baseline` — Heuristic baseline
 
-## Hugging Face Spaces
+Runs the hand-tuned heuristic controller with full scoring:
 
-This repo is configured for a Docker Space:
+```bash
+python -m app.baseline
+```
 
-- README front matter sets `sdk: docker`
-- README metadata includes the `openenv` tag
-- the app serves on `7860`, matching `app_port`
-- `Dockerfile` runs the FastAPI server directly
+---
 
-To deploy:
+## Heuristic Baseline Results
 
-1. Create a new Hugging Face Space using Docker SDK.
-2. Push this repository contents to the Space.
-3. Set the Space secrets for `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN` if you
-   want `inference.py` to call a remote LLM.
-4. Confirm the deployed Space returns `200` from `/health` and responds to `/reset`.
+Reference scores from `python -m app.baseline`:
 
-## Validation Notes
+| Metric | Value |
+| --- | --- |
+| **Overall score** | `0.619` |
+| Stabilization score | `0.812` |
+| Stabilization success | `100.0%` |
+| Optimization score | `0.715` |
+| Optimization success | `77.0%` |
+| Emergency score | `0.414` |
+| Emergency success | `0.0%` |
 
-Local checks completed on this repo:
+This serves as a useful reference point for LLM-based agents.
 
-- `/health`, `/reset`, `/step`, and `/state` respond correctly
-- `/step` returns typed `Reward` payloads
-- grading returns normalized `0.0-1.0` scores
-- the three tasks are available as easy, medium, and hard
-- `python -m app.baseline` runs successfully
-- `python inference.py` runs successfully in deterministic heuristic mode with the required plain-text episode log format
+---
 
 ## License
 
-This project is provided as a benchmark/research environment for OpenEnv-style
-agent evaluation.
+This project was built for the Meta × Scaler Hackathon.
