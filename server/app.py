@@ -93,3 +93,9 @@ async def state_env() -> EnvironmentState:
         return runtime.state()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("server.app:app", host="[IP_ADDRESS]", port=7860, reload=True)
