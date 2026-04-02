@@ -18,6 +18,7 @@ import json
 import os
 import re
 import time
+from collections import deque
 from typing import Any
 
 from dotenv import load_dotenv
@@ -64,11 +65,20 @@ def build_client() -> OpenAI | None:
 
 CLIENT = build_client()
 
-memory = {
+memory: dict[str, Any] = {
     "best_reward": -1e9,
     "best_action": None,
-    "reward_history": []
+    "reward_history": [],
+    "recent_steps": deque(maxlen=3),
 }
+
+
+def reset_memory() -> None:
+    """Reset episode memory at the start of each episode."""
+    memory["best_reward"] = -1e9
+    memory["best_action"] = None
+    memory["reward_history"] = []
+    memory["recent_steps"] = deque(maxlen=3)
 
 
 def compact_action(action: Action) -> dict[str, Any]:
@@ -113,13 +123,11 @@ def compact_state(state: EnvironmentState) -> dict[str, Any]:
 
 
 def build_system_prompt(task_name: str, task_description: str) -> str:
-    """Build the fixed system prompt for the LLM controller."""
-    return "\n".join(
-        [
-            "You are controlling a distillation column in a step-by-step simulation.",
-            "Follow the user's control instructions exactly.",
-            "Output strict JSON only.",
-        ]
+    """Build a concise system prompt for the LLM controller."""
+    return (
+        "You are an AI agent controlling a chemical distillation column. "
+        "Maximize reward by keeping Temperature near 100, Pressure safely below 2.5, "
+        "and Purity above 60. Output ONLY valid JSON."
     )
 
 
@@ -128,162 +136,85 @@ def build_user_prompt(
     state: EnvironmentState,
     last_reward: float | None,
 ) -> str:
-    """Build the step prompt from the current observation and state."""
+    """Build a compact step prompt with static priority rules and rolling history."""
+    # ── Previous action ────────────────────────────────────────────
     prev_steam = state.prev_action.steam_valve if state.prev_action is not None else 50.0
     prev_reflux = state.prev_action.reflux_ratio if state.prev_action is not None else 50.0
     prev_feed = state.prev_action.feed_rate if state.prev_action is not None else 50.0
     prev_vent = state.prev_action.vent if state.prev_action is not None else 0
-    prev_reward = last_reward if last_reward is not None else 0.0
+    prev_reward = f"{last_reward:.4f}" if last_reward is not None else "N/A"
+
+    # ── Best known action ──────────────────────────────────────────
     best_action = memory["best_action"]
-    best_reward = memory["best_reward"]
-    best_steam = best_action.steam_valve if best_action else 50.0
-    best_reflux = best_action.reflux_ratio if best_action else 50.0
-    best_feed = best_action.feed_rate if best_action else 50.0
-    best_vent = best_action.vent if best_action else 0
-    return f"""You are controlling a distillation column in a step-by-step simulation.
+    if best_action is not None:
+        best_block = (
+            f"* Steam: {best_action.steam_valve:.1f}  "
+            f"Reflux: {best_action.reflux_ratio:.1f}  "
+            f"Feed: {best_action.feed_rate:.1f}  "
+            f"Vent: {best_action.vent}\n"
+            f"* Best Reward: {memory['best_reward']:.4f}"
+        )
+    else:
+        best_block = "* No data yet (first step)."
 
-You MUST actively control the system. Passive, repeated, or frozen actions will lead to failure.
+    # ── Rolling history ────────────────────────────────────────────
+    recent = memory["recent_steps"]
+    history_block = "\n".join(recent) if recent else "(no history yet)"
 
-CURRENT STATE:
+    return f"""CURRENT STATE:
 
-* Temperature: {observation.temperature:.4f}
-* Pressure: {observation.pressure:.4f}
-* Purity: {observation.purity:.4f}
-* Flow rate: {observation.flow_rate:.4f}
+* Temperature: {observation.temperature:.1f}
+* Pressure: {observation.pressure:.2f}
+* Purity: {observation.purity:.1f}
+* Flow rate: {observation.flow_rate:.1f}
 
 PREVIOUS ACTION:
 
-* Steam: {prev_steam:.4f}
-* Reflux: {prev_reflux:.4f}
-* Feed: {prev_feed:.4f}
+* Steam: {prev_steam:.1f}
+* Reflux: {prev_reflux:.1f}
+* Feed: {prev_feed:.1f}
 * Vent: {prev_vent}
 
-PREVIOUS REWARD:
-
-* Reward: {prev_reward:.4f}
+PREVIOUS REWARD: {prev_reward}
 
 BEST KNOWN ACTION:
 
-* Steam: {best_steam}
-* Reflux: {best_reflux}
-* Feed: {best_feed}
-* Vent: {best_vent}
-* Best Reward: {best_reward}
+{best_block}
 
-OBJECTIVES:
+RECENT HISTORY (last 3 steps):
 
-* Keep temperature near 90
-* Keep pressure below 2.5 with vent-first safety behavior
-* Increase purity above 60
-* Maintain stable operation while continuously adapting
+{history_block}
 
-CONTROL RULES (STRICT):
+CONTROL HIERARCHY (Follow strictly in order of priority):
 
-* If temperature > 95, decrease steam by at least 5
-* If temperature < 85, increase steam by at least 5
-* If purity < 55, increase reflux by at least 5
-* If purity > 65, decrease reflux by at least 5
-* If system is unstable, prioritize safety over purity
-* Use steam, reflux, feed, and vent over time; do not rely on only one control
-* Never push any variable to 100 unless absolutely necessary
-* If a variable is already high, adjust other variables instead of only increasing it further
+PRIORITY 1: SAFETY (CRITICAL)
+- Vent is your primary safety control. If Pressure > 2.0, "vent" MUST be 1.
+- If Pressure > 2.0, you MUST also decrease "steam_valve".
 
-MEMORY & EXPLOITATION RULES:
+PRIORITY 2: STABILITY
+- Target Temperature is 90.
+- If Temperature > 95, decrease "steam_valve" by at least 5.
+- If Temperature < 85, increase "steam_valve" by at least 5.
 
-* If reward improves, continue in the SAME direction
-* Do NOT abandon strategies that previously gave high reward
-* If performance worsens, move BACK toward the best known action
-* Treat the best action as an anchor, not a fixed point
+PRIORITY 3: OPTIMIZATION
+- Only when Pressure is safe and Temperature is stable, focus on Purity.
+- If Purity < 60, increase "reflux_ratio".
+- Do not let "feed_rate" drop below 20 unless Pressure is critical.
 
-CONTROLLED EXPLORATION RULE:
+PRIORITY 4: ANTI-STAGNATION (MANDATORY)
+- Do NOT output the exact same action as the PREVIOUS ACTION.
+- You MUST change at least one variable (steam, reflux, or feed) by a minimum of 2.0 units every step to explore the environment.
+- If the PREVIOUS REWARD decreased, reverse your previous action direction.
 
-* Do NOT repeat the same action more than 2 steps
-* Always explore small variations around the best action (+/-5 to +/-10)
-* Never remain completely constant
-
-REVERSAL RULE:
-
-* If reward decreases for 2 consecutive steps:
-* reverse the direction of previous changes
-* move back toward previously better values
-
-BALANCE RULE:
-
-* Do NOT change all variables in the same direction
-* Use a mix of variables (steam, reflux, feed, vent)
-* If one variable is high (>85), adjust others instead
-
-STABILITY STRATEGY:
-
-* Near good reward (>0.75), make small adjustments (<=5)
-* Avoid large swings (>15)
-* Maintain balance between all variables
-
-FEED SAFETY:
-
-* Do NOT reduce feed below 20 unless absolutely necessary
-* If feed < 20 and reward is decreasing, increase it
-
-VENT CONTROL (CRITICAL):
-
-* Vent is the PRIMARY pressure safety mechanism
-* If pressure > 2.0 -> vent MUST be 1
-* If pressure is increasing -> vent MUST be 1
-* If reward is decreasing and pressure not improving -> activate vent
-* Do NOT try to control pressure using only steam/reflux/feed
-
-ANTI-FREEZE RULE:
-
-* If action repeats twice, change at least TWO variables
-* Do NOT stay fixed at one configuration
-
-MICRO-ADJUSTMENT RULE:
-
-* Always change at least one variable slightly
-* Avoid zero-change decisions
-
-CRISIS DETECTION:
-
-* If reward drops significantly (more than 0.05 decrease)
-* OR reward decreases for 2 consecutive steps
-* THEN the system is in a BAD STATE
-
-CRISIS RESPONSE (MANDATORY):
-
-* When in a bad state, make LARGE corrective changes (10-20 units)
-* Do NOT continue current strategy
-* Act aggressively to recover
-
-PRIORITY ACTIONS:
-
-1. If pressure is high OR system unstable:
-   * vent MUST be 1
-2. Increase feed if system is collapsing
-3. Adjust steam strongly (not small changes)
-
-ANTI-STAGNATION RULE:
-
-* If reward keeps decreasing, do NOT repeat similar actions
-* Try a DIFFERENT strategy completely
-
-RECOVERY GOAL:
-
-* Focus on stabilizing first, optimizing later
-* Safety and recovery > purity or efficiency
-
-OUTPUT FORMAT:
-
-Return ONLY JSON:
-{{
+OUTPUT FORMAT (STRICT JSON ONLY):
+{{{{
 "steam_valve": number (0-100),
 "reflux_ratio": number (0-100),
 "feed_rate": number (0-100),
 "vent": 0 or 1
-}}
+}}}}
 
-NO explanations.
-NO extra text.
-ONLY JSON."""
+NO explanation. NO text. ONLY JSON."""
 
 
 def parse_model_action(response_text: str) -> Action:
@@ -371,6 +302,8 @@ def run_episode(task_name: str, episode_index: int, seed: int) -> dict[str, Any]
     if task is None:
         raise ValueError(f"Unknown task '{task_name}'.")
 
+    reset_memory()
+
     runtime = OpenEnvRuntime()
     observation = runtime.reset(task_name=task_name, seed=seed)
     last_reward: float | None = None
@@ -398,6 +331,15 @@ def run_episode(task_name: str, episode_index: int, seed: int) -> dict[str, Any]
         )
         observation, reward, done, info = runtime.step(action)
         memory["reward_history"].append(reward.value)
+
+        # Append a compact summary to the rolling history window
+        step_summary = (
+            f"T:{observation.temperature:.1f} P:{observation.pressure:.2f} "
+            f"Pur:{observation.purity:.1f} | "
+            f"Act(S:{action.steam_valve:.1f} R:{action.reflux_ratio:.1f} "
+            f"F:{action.feed_rate:.1f} V:{action.vent}) -> R:{reward.value:.3f}"
+        )
+        memory["recent_steps"].append(step_summary)
 
         if reward.value > memory["best_reward"]:
             memory["best_reward"] = reward.value
