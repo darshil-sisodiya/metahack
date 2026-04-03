@@ -1,3 +1,13 @@
+---
+title: MetaHackathon OpenEnv
+emoji: 🏭
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+app_port: 7860
+---
+
 # OpenEnv — Distillation Column Control Benchmark
 
 > **Meta × Scaler Hackathon Submission** — An LLM-driven agent that controls a simulated industrial distillation column across three progressively harder tasks.
