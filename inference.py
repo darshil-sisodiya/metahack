@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 from collections import deque
 from typing import Any
@@ -31,11 +32,11 @@ from app.tasks import get_all_tasks, get_task_by_name
 
 load_dotenv()
 
-API_BASE_URL = os.environ.get("API_BASE_URL", "").strip()
-MODEL_NAME = os.environ.get("MODEL_NAME", "").strip()
-HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/").strip()
+MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.5-flash").strip()
+HF_TOKEN = os.environ.get("HF_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-API_KEY = HF_TOKEN or OPENAI_API_KEY or os.environ.get("API_KEY", "").strip()
+API_KEY = (HF_TOKEN.strip() if HF_TOKEN else "") or OPENAI_API_KEY or os.environ.get("API_KEY", "").strip()
 
 OPENENV_EPISODES_PER_TASK = max(1, int(os.environ.get("OPENENV_EPISODES_PER_TASK", "1")))
 OPENENV_BASE_SEED = int(os.environ.get("OPENENV_BASE_SEED", "42"))
@@ -216,7 +217,7 @@ OUTPUT FORMAT (STRICT JSON ONLY):
 
 NO explanation. NO text. ONLY JSON."""
 
-
+#TUSHAR
 def parse_model_action(response_text: str) -> Action:
     """Parse the model response into a validated Action."""
     text = response_text.strip()
@@ -269,12 +270,20 @@ def choose_action_with_llm(
             response_format=Action,
         )
     except Exception as exc:
-        print(f"Warning: LLM returned invalid action ({exc}). Using neutral fallback.", flush=True)
+        print(
+            f"Warning: LLM returned invalid action ({exc}). Using neutral fallback.",
+            file=sys.stderr,
+            flush=True,
+        )
         return Action(steam_valve=50.0, reflux_ratio=50.0, feed_rate=50.0, vent=0)
 
     parsed = response.choices[0].message.parsed
     if parsed is None:
-        print("Warning: Model response did not contain a parsed Action. Using neutral fallback.", flush=True)
+        print(
+            "Warning: Model response did not contain a parsed Action. Using neutral fallback.",
+            file=sys.stderr,
+            flush=True,
+        )
         return Action(steam_valve=50.0, reflux_ratio=50.0, feed_rate=50.0, vent=0)
     return parsed
 
