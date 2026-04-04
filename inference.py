@@ -422,7 +422,14 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "task_scores": {name: round(score, 6) for name, score in task_scores.items()},
     }
 
-
+def agent_action(obs: Observation, state: EnvironmentState, last_reward: float | None):
+    return choose_action(
+        task_name="optimization",   # or pass dynamically later
+        task_description="",
+        observation=obs,
+        state=state,
+        last_reward=last_reward,
+    )
 def main() -> None:
     """Run the configured controller across all tasks."""
     all_results: list[dict[str, Any]] = []
