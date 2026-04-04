@@ -1,7 +1,7 @@
 """OpenEnv API - Main FastAPI Application."""
 
 from __future__ import annotations
-
+from inference import choose_action, reset_memory
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,9 @@ if __package__ in {None, ""}:
 from app.models import Action, EnvironmentState, Observation, Reward
 from app.runtime import OpenEnvRuntime
 
+class RunAgentRequest(BaseModel):
+    task_name: str = "optimization"
+    seed: int = 42
 
 class ResetRequest(BaseModel):
     """Optional reset payload for selecting the active task."""
@@ -69,6 +72,41 @@ async def reset_env(request: ResetRequest | None = None) -> Observation:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+
+@app.post("/run-agent")
+async def run_agent(request: RunAgentRequest):
+    reset_memory()
+
+    obs = runtime.reset(task_name=request.task_name, seed=request.seed)
+
+    last_reward = None
+    done = False
+    total_reward = 0.0
+    step_count = 0
+
+    while not done:
+        state = runtime.state()
+
+        action = choose_action(
+            task_name=state.active_task,
+            task_description="",
+            observation=obs,
+            state=state,
+            last_reward=last_reward,
+        )
+
+        obs, reward, done, _ = runtime.step(action)
+
+        last_reward = reward.value
+        total_reward += reward.value
+        step_count += 1
+
+    return {
+        "task": request.task_name,
+        "total_reward": total_reward,
+        "steps": step_count,
+        "final_observation": obs.dict(),
+    }
 
 @app.post("/step", response_model=StepResponse)
 async def step_env(action: Action) -> StepResponse:
