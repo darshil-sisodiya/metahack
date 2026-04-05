@@ -2,7 +2,7 @@
 title: OpenEnv Distillation Control
 emoji: 🧪
 colorFrom: blue
-colorTo: orange
+colorTo: green
 sdk: docker
 pinned: false
 app_port: 7860
