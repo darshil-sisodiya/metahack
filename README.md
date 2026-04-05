@@ -58,8 +58,8 @@ The agent interacts with a rigorous physical simulation with continuous floating
 │                        ZERO-SHOT INFERENCE LOOP                        │
 │                                                                        │
 │  ┌──────────────┐   Observation   ┌──────────────┐   Physics Engine    │
-│  │  LLM Agent   │◄───────────────│    Tasks     │◄────────────────┐   │
-│  │ (Qwen 7B)    │  T, P, Pur, F  │  (tasks.py)  │   Dynamics +    │   │
+│  │  LLM Agent   │◄───────────────│    Tasks     │◄────────────────┐    │
+│  │ (Qwen 7B)    │  T, P, Pur, F  │  (tasks.py)  │   Dynamics +    │    │
 │  │              │────────────────►│              │   Fault Inject  │   │
 │  │   Zero-Shot  │    JSON Action  │   Grader     │────────────────►│   │
 │  │   Inference  │  S, R, F, Vent  │ (grader.py)  │ DistillationEnv │   │
