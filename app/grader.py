@@ -87,10 +87,9 @@ def _compute_episode_score(
 
     clipped = max(SCORE_MIN, min(SCORE_MAX, score))
 
-    epsilon = 1e-6
-    final_score = min(1.0 - epsilon, max(epsilon, clipped))
-    
-    return final_score
+    clamped_score = max(0.001, min(0.999, float(clipped)))
+
+    return clamped_score
 
 
 def compute_episode_score(
