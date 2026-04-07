@@ -85,7 +85,12 @@ def _compute_episode_score(
         # Failed episodes still receive some partial credit for strong control.
         score = min(score, 0.3 + performance_score * 0.5)
 
-    return max(SCORE_MIN, min(SCORE_MAX, score))
+    clipped = max(SCORE_MIN, min(SCORE_MAX, score))
+
+    epsilon = 1e-6
+    final_score = min(1.0 - epsilon, max(epsilon, clipped))
+    
+    return final_score
 
 
 def compute_episode_score(
