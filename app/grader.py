@@ -19,8 +19,8 @@ TASK_WEIGHTS: dict[str, float] = {
     "emergency_control": 0.4,
 }
 
-SCORE_MIN = 0.0
-SCORE_MAX = 1.0
+SCORE_MIN = 0
+SCORE_MAX = 1
 
 
 def random_agent(obs: Observation) -> Action:
@@ -87,9 +87,11 @@ def _compute_episode_score(
 
     clipped = max(SCORE_MIN, min(SCORE_MAX, score))
 
-    clamped_score = max(0.001, min(0.999, float(clipped)))
-
-    return clamped_score
+    # Strict (0, 1) bounds - validator rejects 0.0 and 1.0
+    epsilon = 0.001
+    final_score = epsilon + (1.0 - 2 * epsilon) * clipped
+    
+    return final_score
 
 
 def compute_episode_score(
