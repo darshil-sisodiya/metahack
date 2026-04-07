@@ -1,7 +1,6 @@
 """OpenEnv API - Main FastAPI Application."""
 
 from __future__ import annotations
-from inference import choose_action, reset_memory
 import sys
 from pathlib import Path
 from typing import Any
@@ -9,8 +8,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# Support running `uvicorn main:app` from inside the `app` directory by
-# making the repository root importable before resolving `app.*` modules.
+# Ensure repo root is importable
 if __package__ in {None, ""}:
     repo_root = Path(__file__).resolve().parents[1]
     if str(repo_root) not in sys.path:
@@ -19,20 +17,13 @@ if __package__ in {None, ""}:
 from app.models import Action, EnvironmentState, Observation, Reward
 from app.runtime import OpenEnvRuntime
 
-class RunAgentRequest(BaseModel):
-    task_name: str = "optimization"
-    seed: int = 42
 
 class ResetRequest(BaseModel):
-    """Optional reset payload for selecting the active task."""
-
     task_name: str = "optimization"
     seed: int = 42
 
 
 class StepResponse(BaseModel):
-    """Response payload returned by the `/step` endpoint."""
-
     observation: Observation
     reward: Reward
     done: bool
@@ -45,72 +36,33 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Single shared runtime instance for the running server.
+# Shared runtime
 runtime = OpenEnvRuntime()
 
 
 @app.get("/")
 async def root() -> dict[str, str]:
-    """Root endpoint mirrors the health response for convenience."""
     return {"status": "ok"}
 
 
 @app.get("/health")
 async def health_check() -> dict[str, str]:
-    """Health check endpoint."""
     return {"status": "ok"}
 
 
 @app.post("/reset", response_model=Observation)
 async def reset_env(request: ResetRequest | None = None) -> Observation:
-    """Create a new seeded environment/task instance and return the first observation."""
-    task_name = request.task_name if request is not None else "optimization"
-    seed = request.seed if request is not None else 42
+    task_name = request.task_name if request else "optimization"
+    seed = request.seed if request else 42
 
     try:
         return runtime.reset(task_name=task_name, seed=seed)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
-
-@app.post("/run-agent")
-async def run_agent(request: RunAgentRequest):
-    reset_memory()
-
-    obs = runtime.reset(task_name=request.task_name, seed=request.seed)
-
-    last_reward = None
-    done = False
-    total_reward = 0.0
-    step_count = 0
-
-    while not done:
-        state = runtime.state()
-
-        action = choose_action(
-            task_name=state.active_task,
-            task_description="",
-            observation=obs,
-            state=state,
-            last_reward=last_reward,
-        )
-
-        obs, reward, done, _ = runtime.step(action)
-
-        last_reward = reward.value
-        total_reward += reward.value
-        step_count += 1
-
-    return {
-        "task": request.task_name,
-        "total_reward": total_reward,
-        "steps": step_count,
-        "final_observation": obs.dict(),
-    }
 
 @app.post("/step", response_model=StepResponse)
 async def step_env(action: Action) -> StepResponse:
-    """Advance the current environment by one step."""
     try:
         observation, reward, done, info = runtime.step(action)
         return StepResponse(
@@ -119,25 +71,23 @@ async def step_env(action: Action) -> StepResponse:
             done=done,
             info=info,
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/state", response_model=EnvironmentState)
 @app.post("/state", response_model=EnvironmentState)
 async def state_env() -> EnvironmentState:
-    """Return the current environment state."""
     try:
         return runtime.state()
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 def main():
-    """Entry point for the OpenEnv validation script."""
     import uvicorn
-    # 0.0.0.0 is strictly required for Hugging Face Spaces
-    uvicorn.run("server.app:app", host="0.0.0.0", port=7860, reload=True)
+    uvicorn.run("server.app:app", host="0.0.0.0", port=7860)
+
 
 if __name__ == "__main__":
     main()
