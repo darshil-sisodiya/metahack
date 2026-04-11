@@ -34,3 +34,6 @@ Thumbs.db
 
 #pyenv (optional)
 .python-version
+
+test_eval.py
+test_json.py

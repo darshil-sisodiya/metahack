@@ -174,7 +174,17 @@ async def state_env() -> dict[str, Any]:
 
 @app.post("/run-agent", response_model=RunAgentResponse)
 async def run_agent(request: Request) -> RunAgentResponse:
-    return RunAgentResponse(action={"steam_valve": 50.0, "reflux_ratio": 50.0, "feed_rate": 50.0, "vent": 0})
+    try:
+        body = await request.json()
+        obs_data = body.get("observation", {})
+        
+        from app.models import Observation
+        from app.baseline import baseline_agent
+        obs = Observation(**obs_data)
+        action = baseline_agent(obs)
+        return RunAgentResponse(action=action.model_dump())
+    except Exception:
+        return RunAgentResponse(action={"steam_valve": 50.0, "reflux_ratio": 50.0, "feed_rate": 50.0, "vent": 0})
 
 @app.post("/evaluate", response_model=EvaluateResponse)
 async def evaluate_env(request: Request) -> EvaluateResponse:
