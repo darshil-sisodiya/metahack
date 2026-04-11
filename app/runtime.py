@@ -42,7 +42,17 @@ class OpenEnvRuntime:
         """Advance the selected task by one step."""
         if self.env is None or self.task is None:
             raise ValueError("Environment not initialized. Call reset() first.")
-        return self.task.step(self.env, action)
+        observation, reward, done, info = self.task.step(self.env, action)
+
+        # Nuclear clamp: guarantee reward.value is strictly in (0, 1)
+        reward.value = max(0.001, min(0.999, float(reward.value)))
+
+        # Clamp any score-like values that may exist in the info dict
+        for key in ("score", "task_score", "episode_score"):
+            if key in info:
+                info[key] = max(0.001, min(0.999, float(info[key])))
+
+        return observation, reward, done, info
 
     def state(self) -> EnvironmentState:
         """Return the current runtime state as a typed model."""
