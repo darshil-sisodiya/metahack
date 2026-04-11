@@ -19,8 +19,8 @@ TASK_WEIGHTS: dict[str, float] = {
     "emergency_control": 0.4,
 }
 
-SCORE_MIN = 0.001
-SCORE_MAX = 0.999
+SCORE_MIN = 0.1
+SCORE_MAX = 0.99
 SUBMISSION_ROUND_DIGITS = 6
 
 
