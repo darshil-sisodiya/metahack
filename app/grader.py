@@ -19,8 +19,8 @@ TASK_WEIGHTS: dict[str, float] = {
     "emergency_control": 0.4,
 }
 
-SCORE_MIN = 0
-SCORE_MAX = 1
+SCORE_MIN = 0.0
+SCORE_MAX = 1.0
 
 
 def random_agent(obs: Observation) -> Action:
@@ -87,11 +87,9 @@ def _compute_episode_score(
 
     clipped = max(SCORE_MIN, min(SCORE_MAX, score))
 
-    # Strict (0, 1) bounds - validator rejects 0.0 and 1.0
-    epsilon = 0.001
-    final_score = epsilon + (1.0 - 2 * epsilon) * clipped
-    
-    return final_score
+    clamped_score = max(0.001, min(0.999, float(clipped)))
+
+    return clamped_score
 
 
 def compute_episode_score(
@@ -197,6 +195,7 @@ def evaluate_all_tasks(
             episode_results.append(_run_episode(task_instance, seed, agent_fn))
 
         avg_score = sum(result["score"] for result in episode_results) / n_episodes
+        avg_score = max(0.001, min(0.999, float(avg_score)))
         success_rate = sum(1 for result in episode_results if result["success"]) / n_episodes
         failure_rate = sum(1 for result in episode_results if result["failed"]) / n_episodes
         avg_steps = sum(result["steps"] for result in episode_results) / n_episodes
@@ -213,6 +212,7 @@ def evaluate_all_tasks(
     weighted_total = sum(task_scores[name] * TASK_WEIGHTS[name] for name in task_scores)
     total_weight = sum(TASK_WEIGHTS[name] for name in task_scores)
     overall_score = weighted_total / total_weight if total_weight > 0 else 0.0
+    overall_score = max(0.001, min(0.999, float(overall_score)))
 
     return {
         "overall_score": overall_score,

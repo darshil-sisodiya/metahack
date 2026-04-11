@@ -408,10 +408,12 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         if not task_results:
             continue
         task_scores[task_name] = sum(result["score"] for result in task_results) / len(task_results)
+        task_scores[task_name] = max(0.001, min(0.999, float(task_scores[task_name])))
 
     total_weight = sum(TASK_WEIGHTS[name] for name in task_scores)
     weighted_total = sum(task_scores[name] * TASK_WEIGHTS[name] for name in task_scores)
     overall_score = weighted_total / total_weight if total_weight > 0 else 0.0
+    overall_score = max(0.001, min(0.999, float(overall_score)))
 
     return {
         "kind": "summary",
