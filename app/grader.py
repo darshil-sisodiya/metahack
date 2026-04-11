@@ -19,8 +19,8 @@ TASK_WEIGHTS: dict[str, float] = {
     "emergency_control": 0.4,
 }
 
-SCORE_MIN = 0.0001
-SCORE_MAX = 0.9999
+SCORE_MIN = 0.1
+SCORE_MAX = 0.99
 
 
 def random_agent(obs: Observation) -> Action:
@@ -52,7 +52,7 @@ def _compute_performance_score(cumulative_reward: float, max_steps: int) -> floa
     clipped [-1, 1] band into [0.0, 0.6].
     """
     if max_steps <= 0:
-        return 0.0001
+        return 0.1
 
     normalized_reward = cumulative_reward / max_steps
     clipped_reward = max(-1.0, min(1.0, normalized_reward))
@@ -62,7 +62,7 @@ def _compute_performance_score(cumulative_reward: float, max_steps: int) -> floa
 def _compute_efficiency_bonus(success: bool, steps: int, max_steps: int) -> float:
     """Return an early-success bonus in the 0.0-0.1 range."""
     if not success or max_steps <= 1:
-        return 0.0001
+        return 0.0
 
     remaining_steps = max(max_steps - steps, 0)
     return (remaining_steps / max_steps) * 0.1
@@ -77,7 +77,7 @@ def _compute_episode_score(
 ) -> float:
     """Compute the final clamped episode score in the required 0.0-1.0 range."""
     performance_score = _compute_performance_score(cumulative_reward, max_steps)
-    success_bonus = 0.3 if success else 0.0001
+    success_bonus = 0.3 if success else 0.0
     efficiency_bonus = _compute_efficiency_bonus(success, steps, max_steps)
 
     score = performance_score + success_bonus + efficiency_bonus
@@ -87,7 +87,7 @@ def _compute_episode_score(
 
     clipped = max(SCORE_MIN, min(SCORE_MAX, score))
 
-    clamped_score = max(0.001, min(0.999, float(clipped)))
+    clamped_score = max(0.1, min(0.99, float(clipped)))
 
     return clamped_score
 
@@ -195,7 +195,7 @@ def evaluate_all_tasks(
             episode_results.append(_run_episode(task_instance, seed, agent_fn))
 
         avg_score = sum(result["score"] for result in episode_results) / n_episodes
-        avg_score = max(0.001, min(0.999, float(avg_score)))
+        avg_score = max(0.1, min(0.99, float(avg_score)))
         success_rate = sum(1 for result in episode_results if result["success"]) / n_episodes
         failure_rate = sum(1 for result in episode_results if result["failed"]) / n_episodes
         avg_steps = sum(result["steps"] for result in episode_results) / n_episodes
@@ -212,7 +212,7 @@ def evaluate_all_tasks(
     weighted_total = sum(task_scores[name] * TASK_WEIGHTS[name] for name in task_scores)
     total_weight = sum(TASK_WEIGHTS[name] for name in task_scores)
     overall_score = weighted_total / total_weight if total_weight > 0 else 0.0
-    overall_score = max(0.001, min(0.999, float(overall_score)))
+    overall_score = max(0.1, min(0.99, float(overall_score)))
 
     return {
         "overall_score": overall_score,

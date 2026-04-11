@@ -45,8 +45,8 @@ API_CALL_DELAY = max(0.0, float(os.environ.get("API_CALL_DELAY", "0")))
 
 AGENT_MODE = "llm"
 
-SCORE_MIN = 0.001
-SCORE_MAX = 0.999
+SCORE_MIN = 0.1
+SCORE_MAX = 0.99
 
 
 def clamp_open_score(value: float) -> float:
