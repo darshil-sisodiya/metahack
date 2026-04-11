@@ -20,7 +20,7 @@ TASK_WEIGHTS: dict[str, float] = {
 }
 
 SCORE_MIN = 0.0001
-SCORE_MAX = 0.0009
+SCORE_MAX = 0.9999
 
 
 def random_agent(obs: Observation) -> Action:
