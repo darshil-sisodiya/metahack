@@ -4,8 +4,8 @@ Conforms to the OpenEnv v0.2.1 standard API contract:
 - /health  → {"status": "healthy"}
 - /metadata → {"name": "...", "description": "..."}
 - /schema  → {"action": {}, "observation": {}, "state": {}}
-- /reset   → {"observation": {...}, "reward": null, "done": false}
-- /step    → {"observation": {...}, "reward": float, "done": bool}
+- /reset   → {"observation": {...}, "reward": null, "done": false, "info": {}}
+- /step    → {"observation": {...}, "reward": float, "done": bool, "info": {...}}
 - /evaluate → {"score": float, "success": bool, "failed": bool, "steps": int}
 """
 
@@ -46,8 +46,9 @@ class ResetResponse(BaseModel):
     observation: dict[str, Any] = Field(..., description="Initial observation from the environment")
     reward: Optional[float] = Field(default=None, description="Initial reward (typically None at reset)")
     done: bool = Field(default=False, description="Whether episode is already done")
+    info: dict[str, Any] = Field(default_factory=dict, description="Task metadata")
 
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "allow"}
 
 
 class StepRequest(BaseModel):
@@ -68,8 +69,9 @@ class StepResponse(BaseModel):
     observation: dict[str, Any] = Field(..., description="Observation resulting from the action")
     reward: Optional[float] = Field(default=None, description="Reward signal from the action")
     done: bool = Field(default=False, description="Whether the episode has terminated")
+    info: dict[str, Any] = Field(default_factory=dict, description="Critical grading metrics")
 
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "allow"}
 
 
 class HealthResponse(BaseModel):
@@ -170,6 +172,7 @@ async def reset_env(request: ResetRequest | None = None) -> ResetResponse:
             observation=obs_dict,
             reward=None,
             done=False,
+            info={},  # Ensure info dict is passed safely
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -193,6 +196,7 @@ async def step_env(request: StepRequest) -> StepResponse:
             observation=obs_dict,
             reward=reward_float,
             done=done,
+            info=info,  # <--- CRITICAL: Do not drop this!
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
