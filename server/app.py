@@ -1,12 +1,21 @@
-"""OpenEnv API - Main FastAPI Application."""
+"""OpenEnv API - Main FastAPI Application.
+
+Conforms to the OpenEnv v0.2.1 standard API contract:
+- /health  → {"status": "healthy"}
+- /metadata → {"name": "...", "description": "..."}
+- /schema  → {"action": {}, "observation": {}, "state": {}}
+- /reset   → {"observation": {...}, "reward": null, "done": false}
+- /step    → {"observation": {...}, "reward": float, "done": bool}
+- /evaluate → {"score": float, "success": bool, "failed": bool, "steps": int}
+"""
 
 from __future__ import annotations
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Ensure repo root is importable
 if __package__ in {None, ""}:
@@ -18,70 +27,69 @@ from app.models import Action, EnvironmentState, Observation, Reward
 from app.runtime import OpenEnvRuntime
 
 
+# ---------------------------------------------------------------------------
+# OpenEnv-Standard Pydantic Schemas
+# ---------------------------------------------------------------------------
+
 class ResetRequest(BaseModel):
+    """Request model for /reset, matching openenv.core.env_server.types.ResetRequest."""
+    seed: Optional[int] = Field(default=None, description="Random seed for reproducible episodes")
+    episode_id: Optional[str] = Field(default=None, description="Custom episode identifier")
+    # Allow extra fields for task_name or any custom parameters
     task_name: str = "optimization"
-    seed: int = 42
+
+    model_config = {"extra": "allow"}
+
+
+class ResetResponse(BaseModel):
+    """Response matching openenv.core.env_server.types.ResetResponse."""
+    observation: dict[str, Any] = Field(..., description="Initial observation from the environment")
+    reward: Optional[float] = Field(default=None, description="Initial reward (typically None at reset)")
+    done: bool = Field(default=False, description="Whether episode is already done")
+
+    model_config = {"extra": "forbid"}
+
+
+class StepRequest(BaseModel):
+    """Request model for /step, matching openenv.core.env_server.types.StepRequest."""
+    action: dict[str, Any] = Field(..., description="Action to execute")
+    timeout_s: Optional[float] = Field(default=None, description="Optional timeout")
+    request_id: Optional[str] = Field(default=None, description="Optional request ID")
+
+    model_config = {"extra": "allow"}
 
 
 class StepResponse(BaseModel):
-    observation: Observation
-    reward: Reward
-    done: bool
-    info: dict[str, Any]
+    """Response matching openenv.core.env_server.types.StepResponse.
+
+    CRITICAL: reward is Optional[float], NOT a Reward object.
+    The OpenEnv validator parses reward as a plain float.
+    """
+    observation: dict[str, Any] = Field(..., description="Observation resulting from the action")
+    reward: Optional[float] = Field(default=None, description="Reward signal from the action")
+    done: bool = Field(default=False, description="Whether the episode has terminated")
+
+    model_config = {"extra": "forbid"}
 
 
-app = FastAPI(
-    title="OpenEnv",
-    description="OpenEnv Environment API",
-    version="0.1.0",
-)
-
-# Shared runtime
-runtime = OpenEnvRuntime()
+class HealthResponse(BaseModel):
+    """Response matching openenv.core.env_server.types.HealthResponse."""
+    status: str = Field(default="healthy", description="Health status")
 
 
-@app.get("/")
-async def root() -> dict[str, str]:
-    return {"status": "ok"}
+class MetadataResponse(BaseModel):
+    """Response matching openenv.core.env_server.types.EnvironmentMetadata."""
+    name: str = Field(..., description="Name of the environment")
+    description: str = Field(..., description="Description of the environment")
+    version: Optional[str] = Field(default=None, description="Version")
+    author: Optional[str] = Field(default=None, description="Author")
 
 
-@app.get("/health")
-async def health_check() -> dict[str, str]:
-    return {"status": "ok"}
-
-
-@app.post("/reset", response_model=Observation)
-async def reset_env(request: ResetRequest | None = None) -> Observation:
-    task_name = request.task_name if request else "optimization"
-    seed = request.seed if request else 42
-
-    try:
-        return runtime.reset(task_name=task_name, seed=seed)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/step", response_model=StepResponse)
-async def step_env(action: Action) -> StepResponse:
-    try:
-        observation, reward, done, info = runtime.step(action)
-        return StepResponse(
-            observation=observation,
-            reward=reward,
-            done=done,
-            info=info,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.get("/state", response_model=EnvironmentState)
-@app.post("/state", response_model=EnvironmentState)
-async def state_env() -> EnvironmentState:
-    try:
-        return runtime.state()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+class SchemaResponse(BaseModel):
+    """Response matching openenv.core.env_server.types.SchemaResponse."""
+    action: dict[str, Any] = Field(..., description="JSON schema for actions")
+    observation: dict[str, Any] = Field(..., description="JSON schema for observations")
+    state: dict[str, Any] = Field(..., description="JSON schema for state")
 
 
 class EvaluateRequest(BaseModel):
@@ -95,6 +103,109 @@ class EvaluateResponse(BaseModel):
     success: bool = False
     failed: bool = False
     steps: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Application Setup
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="OpenEnv",
+    description="OpenEnv Environment API",
+    version="0.1.0",
+)
+
+# Shared runtime
+runtime = OpenEnvRuntime()
+
+
+def _clamp_score(value: float) -> float:
+    """Clamp a score to strictly (0, 1) — never 0.0 or 1.0."""
+    return max(0.1, min(0.99, float(value)))
+
+
+# ---------------------------------------------------------------------------
+# Endpoints conforming to OpenEnv v0.2.1 standard
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+async def root() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check() -> HealthResponse:
+    return HealthResponse(status="healthy")
+
+
+@app.get("/metadata", response_model=MetadataResponse)
+async def metadata() -> MetadataResponse:
+    return MetadataResponse(
+        name="openenv-distillation-control",
+        description="Industrial distillation-column control benchmark with typed OpenEnv reset/step/state APIs.",
+        version="0.2.0",
+        author="metahack",
+    )
+
+
+@app.get("/schema", response_model=SchemaResponse)
+async def schema() -> SchemaResponse:
+    return SchemaResponse(
+        action=Action.model_json_schema(),
+        observation=Observation.model_json_schema(),
+        state=EnvironmentState.model_json_schema(),
+    )
+
+
+@app.post("/reset", response_model=ResetResponse)
+async def reset_env(request: ResetRequest | None = None) -> ResetResponse:
+    task_name = request.task_name if request else "optimization"
+    seed = request.seed if request else 42
+
+    try:
+        obs = runtime.reset(task_name=task_name, seed=seed)
+        # Serialize observation to a plain dict — OpenEnv standard format
+        obs_dict = obs.model_dump()
+        return ResetResponse(
+            observation=obs_dict,
+            reward=None,
+            done=False,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/step", response_model=StepResponse)
+async def step_env(request: StepRequest) -> StepResponse:
+    try:
+        # Deserialize the action dict into our typed Action model
+        action = Action.model_validate(request.action)
+        observation, reward, done, info = runtime.step(action)
+
+        # Serialize observation to a plain dict
+        obs_dict = observation.model_dump()
+
+        # Extract reward as a PLAIN FLOAT — this is critical.
+        # OpenEnv v0.2.1 StepResponse.reward is Optional[float], NOT a Reward object.
+        reward_float = _clamp_score(reward.value)
+
+        return StepResponse(
+            observation=obs_dict,
+            reward=reward_float,
+            done=done,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/state")
+@app.post("/state")
+async def state_env() -> dict[str, Any]:
+    try:
+        env_state = runtime.state()
+        return env_state.model_dump()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/evaluate", response_model=EvaluateResponse)
@@ -114,7 +225,7 @@ async def evaluate_env(request: EvaluateRequest | None = None) -> EvaluateRespon
     # If trajectory is empty or missing, return a safe default score
     if not trajectory:
         return EvaluateResponse(
-            score=max(0.1, min(0.99, 0.5)),
+            score=_clamp_score(0.5),
             success=False,
             failed=False,
             steps=0,
@@ -137,8 +248,8 @@ async def evaluate_env(request: EvaluateRequest | None = None) -> EvaluateRespon
         max_steps=task.max_steps,
     )
 
-    # Final nuclear clamp — this value CANNOT be 0.0 or 1.0
-    score = max(0.1, min(0.99, float(score)))
+    # Final nuclear clamp
+    score = _clamp_score(score)
 
     return EvaluateResponse(
         score=score,
