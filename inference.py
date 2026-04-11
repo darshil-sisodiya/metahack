@@ -45,8 +45,9 @@ API_CALL_DELAY = max(0.0, float(os.environ.get("API_CALL_DELAY", "0")))
 
 AGENT_MODE = "llm"
 
-SCORE_MIN = 0.001
-SCORE_MAX = 0.999
+# FIX 1: Widened the clamps to match the server
+SCORE_MIN = 0.1
+SCORE_MAX = 0.99
 
 
 def clamp_open_score(value: float) -> float:
@@ -216,16 +217,15 @@ PRIORITY 4: ANTI-STAGNATION (MANDATORY)
 - If the PREVIOUS REWARD decreased, reverse your previous action direction.
 
 OUTPUT FORMAT (STRICT JSON ONLY):
-{{{{
+{{
 "steam_valve": number (0-100),
 "reflux_ratio": number (0-100),
 "feed_rate": number (0-100),
 "vent": 0 or 1
-}}}}
+}}
 
 NO explanation. NO text. ONLY JSON."""
 
-#TUSHAR
 def parse_model_action(response_text: str) -> Action:
     """Parse the model response into a validated Action."""
     text = response_text.strip()
@@ -433,14 +433,17 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "task_scores": {name: round(score, 6) for name, score in task_scores.items()},
     }
 
+# FIX 2: Dynamically assigning the task instead of hardcoding "optimization"
 def agent_action(obs: Observation, state: EnvironmentState, last_reward: float | None):
+    active_task = state.active_task if state.active_task else "optimization"
     return choose_action(
-        task_name="optimization",   # or pass dynamically later
+        task_name=active_task,
         task_description="",
         observation=obs,
         state=state,
         last_reward=last_reward,
     )
+
 def main() -> None:
     """Run the configured controller across all tasks."""
     all_results: list[dict[str, Any]] = []
@@ -457,8 +460,9 @@ def main() -> None:
                 )
             )
 
- 
-
+    # FIX 3: Actually calling the summarize function and printing the output so the validator can read it!
+    summary = summarize_results(all_results)
+    print(json.dumps(summary, indent=2), flush=True)
 
 if __name__ == "__main__":
     main()
