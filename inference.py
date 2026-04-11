@@ -45,6 +45,14 @@ API_CALL_DELAY = max(0.0, float(os.environ.get("API_CALL_DELAY", "0")))
 
 AGENT_MODE = "llm"
 
+SCORE_MIN = 0.001
+SCORE_MAX = 0.999
+
+
+def clamp_open_score(value: float) -> float:
+    """Clamp a score to the strict-open submission range (0, 1)."""
+    return max(SCORE_MIN, min(SCORE_MAX, float(value)))
+
 
 def build_client() -> OpenAI | None:
     """Create the OpenAI-compatible client when running in LLM mode."""
@@ -379,6 +387,7 @@ def run_episode(task_name: str, episode_index: int, seed: int) -> dict[str, Any]
         steps=step_count,
         max_steps=task.max_steps,
     )
+    score = clamp_open_score(score)
 
     result = {
         "task": task_name,
@@ -408,12 +417,12 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         if not task_results:
             continue
         task_scores[task_name] = sum(result["score"] for result in task_results) / len(task_results)
-        task_scores[task_name] = max(0.001, min(0.999, float(task_scores[task_name])))
+        task_scores[task_name] = clamp_open_score(task_scores[task_name])
 
     total_weight = sum(TASK_WEIGHTS[name] for name in task_scores)
     weighted_total = sum(task_scores[name] * TASK_WEIGHTS[name] for name in task_scores)
     overall_score = weighted_total / total_weight if total_weight > 0 else 0.0
-    overall_score = max(0.001, min(0.999, float(overall_score)))
+    overall_score = clamp_open_score(overall_score)
 
     return {
         "kind": "summary",
@@ -447,6 +456,8 @@ def main() -> None:
                     seed=seed,
                 )
             )
+
+ 
 
 
 if __name__ == "__main__":
