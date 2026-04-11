@@ -2,7 +2,8 @@
 name: openenv-distillation-control
 version: "0.2.0"
 description: Industrial distillation-column control benchmark with typed OpenEnv reset/step/state APIs.
-entrypoint: uvicorn server.main:app --host 0.0.0.0 --port 7860
+# FIX 1: Point to server/app.py instead of the non-existent main.py
+entrypoint: uvicorn server.app:app --host 0.0.0.0 --port 7860
 port: 7860
 framework: fastapi
 tags:
@@ -16,13 +17,11 @@ endpoints:
   state:
     - GET /state
     - POST /state
-  run_agent: POST /run-agent
+  # FIX 2: Map the validator to our indestructible evaluate endpoint
+  evaluate: POST /evaluate
+
 # ─────────────────────────────────────────────────────────────
 # Task Parameters
-# These values are loaded at runtime by app/config.py.
-# Any key present here overrides the Python-level default.
-# Removing a key causes the code to fall back to its built-in
-# default, so the file is always safe to trim.
 # ─────────────────────────────────────────────────────────────
 tasks:
   - name: stabilization
