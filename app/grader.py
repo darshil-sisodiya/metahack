@@ -19,8 +19,8 @@ TASK_WEIGHTS: dict[str, float] = {
     "emergency_control": 0.4,
 }
 
-SCORE_MIN = 0.0
-SCORE_MAX = 1.0
+SCORE_MIN = 0.0001
+SCORE_MAX = 0.0009
 
 
 def random_agent(obs: Observation) -> Action:
@@ -52,7 +52,7 @@ def _compute_performance_score(cumulative_reward: float, max_steps: int) -> floa
     clipped [-1, 1] band into [0.0, 0.6].
     """
     if max_steps <= 0:
-        return 0.0
+        return 0.0001
 
     normalized_reward = cumulative_reward / max_steps
     clipped_reward = max(-1.0, min(1.0, normalized_reward))
@@ -62,7 +62,7 @@ def _compute_performance_score(cumulative_reward: float, max_steps: int) -> floa
 def _compute_efficiency_bonus(success: bool, steps: int, max_steps: int) -> float:
     """Return an early-success bonus in the 0.0-0.1 range."""
     if not success or max_steps <= 1:
-        return 0.0
+        return 0.0001
 
     remaining_steps = max(max_steps - steps, 0)
     return (remaining_steps / max_steps) * 0.1
@@ -77,7 +77,7 @@ def _compute_episode_score(
 ) -> float:
     """Compute the final clamped episode score in the required 0.0-1.0 range."""
     performance_score = _compute_performance_score(cumulative_reward, max_steps)
-    success_bonus = 0.3 if success else 0.0
+    success_bonus = 0.3 if success else 0.0001
     efficiency_bonus = _compute_efficiency_bonus(success, steps, max_steps)
 
     score = performance_score + success_bonus + efficiency_bonus
