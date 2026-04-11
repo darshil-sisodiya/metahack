@@ -4,17 +4,14 @@ Runs a deterministic heuristic agent against the task grader.
 """
 
 from __future__ import annotations
+import json
 
 from app.grader import evaluate_all_tasks
 from app.models import Action, Observation
 
 
 def baseline_agent(obs: Observation) -> Action:
-    """Return a simple but task-aware deterministic heuristic action.
-
-    The policy aims to keep the column near the purity-friendly temperature
-    band while shedding pressure early enough to avoid instability.
-    """
+    """Return a simple but task-aware deterministic heuristic action."""
     target_temp = 92.0
     if obs.pressure > 2.0:
         target_temp = 82.0
@@ -60,20 +57,22 @@ def baseline_agent(obs: Observation) -> Action:
 
 
 def main() -> None:
-    """Run baseline evaluation and print a compact summary."""
-    results = evaluate_all_tasks(baseline_agent, n_episodes=200)
+    """Run baseline evaluation and print the STRICT JSON summary."""
+    # REDUCED from 200 to 5 to prevent validator timeouts
+    episodes = 5
+    results = evaluate_all_tasks(baseline_agent, n_episodes=episodes)
 
-    print("BASELINE EVALUATION")
-    print("Score Range: strictly between 0 and 1")
-    print(f"Overall Score: {results['overall_score']:.3f}")
-    print("Per-Task Scores:")
-    for task_name, score in results["task_scores"].items():
-        print(f"  {task_name}: {score:.3f}")
-
-    print("Success Rates:")
-    for task_name, task_details in results["details"].items():
-        success_rate = task_details["success_rate"] * 100.0
-        print(f"  {task_name}: {success_rate:.1f}%")
+    # Output EXACTLY the JSON format the platform parser expects
+    summary = {
+        "kind": "summary",
+        "mode": "baseline",
+        "model": "heuristic",
+        "episodes_per_task": episodes,
+        "overall_score": results["overall_score"],
+        "task_scores": results["task_scores"]
+    }
+    
+    print(json.dumps(summary, indent=2), flush=True)
 
 
 if __name__ == "__main__":
