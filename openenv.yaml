@@ -18,6 +18,7 @@ endpoints:
     - GET /state
     - POST /state
   # FIX 2: Map the validator to our indestructible evaluate endpoint
+  run_agent: POST /run-agent
   evaluate: POST /evaluate
 
 # ─────────────────────────────────────────────────────────────
