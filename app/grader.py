@@ -58,24 +58,24 @@ def _coerce_action(action: Action | dict[str, Any]) -> Action:
 
 
 def _compute_performance_score(cumulative_reward: float, max_steps: int) -> float:
-    """Normalize episode reward into the 0.0-0.6 performance range.
+    """Normalize episode reward into a continuous 0.1-0.55 performance range.
 
     Reward is normalized by task horizon so episodes from tasks with different
     lengths remain comparable. The normalized value is then mapped from a
-    clipped [-1, 1] band into [0.0, 0.6].
+    clipped [-1, 1] band into [0.1, 0.55].
     """
     if max_steps <= 0:
-        return 0.0001
+        return 0.1
 
     normalized_reward = cumulative_reward / max_steps
     clipped_reward = max(-1.0, min(1.0, normalized_reward))
-    return ((clipped_reward + 1.0) / 2.0) * 0.6
+    return 0.1 + (((clipped_reward + 1.0) / 2.0) * 0.45)
 
 
 def _compute_efficiency_bonus(success: bool, steps: int, max_steps: int) -> float:
     """Return an early-success bonus in the 0.0-0.1 range."""
     if not success or max_steps <= 1:
-        return 0.0001
+        return 0.0
 
     remaining_steps = max(max_steps - steps, 0)
     return (remaining_steps / max_steps) * 0.1
@@ -88,17 +88,14 @@ def _compute_episode_score(
     steps: int,
     max_steps: int,
 ) -> float:
-    """Compute the final clamped episode score in the required 0.0-1.0 range."""
+    """Compute a continuous episode score before final public sanitization."""
     performance_score = _compute_performance_score(cumulative_reward, max_steps)
-    success_bonus = 0.3 if success else 0.0001
+    base_score = 0.05
+    success_bonus = 0.1 if success else 0.0
+    failure_penalty = -0.1 if failed else 0.0
     efficiency_bonus = _compute_efficiency_bonus(success, steps, max_steps)
 
-    score = performance_score + success_bonus + efficiency_bonus
-    if failed:
-        # Failed episodes still receive some partial credit for strong control.
-        score = min(score, 0.3 + performance_score * 0.5)
-
-    return sanitize_public_score(score)
+    return base_score + performance_score + success_bonus + failure_penalty + efficiency_bonus
 
 
 def compute_episode_score(
@@ -148,6 +145,7 @@ def _run_episode(
         steps=int(info.get("step_count", 0)),
         max_steps=task.max_steps,
     )
+    score = sanitize_public_score(score)
 
     return {
         "score": score,

@@ -938,8 +938,9 @@ class EmergencyControlTask(BaseTask):
         temp_deviation = abs(obs.temperature - temp_target)
         temperature_stability_score = max(0.0, 1.0 - temp_deviation / temp_scale)
 
-        # Recovery bonus (state already updated by _update_internal_state)
-        recovery_bonus = 1.0 if self._recovery_achieved else 0.0
+        # Recovery bonus stays continuous as stability accumulates.
+        required_steps = max(1, int(self.config["stability_required_consecutive_steps"]))
+        recovery_bonus = min(self._consecutive_stable_steps / required_steps, 1.0)
 
         # Escalation penalty
         escalation = info.get("instability_escalation", 0.0)

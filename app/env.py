@@ -95,15 +95,12 @@ class DistillationEnv:
             - 0.2 * energy_penalty
         )
 
-        # FIXED: clip before normalization
+        # Keep the environment reward continuous; strict-open sanitization
+        # happens only when a public score is emitted.
         clipped = max(-1.0, min(1.0, raw_reward))
-        normalized = (clipped + 1.0) / 2.0
-
-        # STRICT (0,1)
-        final_reward = 0.01 + 0.98 * normalized
 
         reward = Reward(
-            value=final_reward,
+            value=clipped,
             components={
                 "purity": purity_score,
                 "pressure_penalty": pressure_penalty,

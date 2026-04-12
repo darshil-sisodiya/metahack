@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import io
 import unittest
+from contextlib import redirect_stdout
+from unittest.mock import patch
 
 from app.grader import TASK_WEIGHTS, compute_episode_score, evaluate_all_tasks
 from app.models import Action, Observation
 from app.scoring import PUBLIC_SCORE_MAX, PUBLIC_SCORE_MIN, sanitize_public_score
-from inference import summarize_results
+from inference import run_episode, summarize_results
 
 
 def neutral_agent(_: Observation) -> Action:
@@ -94,6 +97,23 @@ class PublicScoringTests(unittest.TestCase):
         self.assertEqual(set(summary["task_scores"]), set(TASK_WEIGHTS))
         for score in summary["task_scores"].values():
             self.assert_strict_open(score)
+
+    def test_run_episode_emits_required_log_shape(self) -> None:
+        stdout = io.StringIO()
+        fixed_action = Action(steam_valve=50.0, reflux_ratio=50.0, feed_rate=50.0, vent=0)
+        with patch("inference.choose_action", return_value=fixed_action):
+            with redirect_stdout(stdout):
+                result = run_episode("stabilization", episode_index=0, seed=42)
+
+        lines = [line for line in stdout.getvalue().splitlines() if line]
+        self.assertGreater(len(lines), 2)
+        self.assertTrue(lines[0].startswith("[START] task=stabilization env=openenv model="))
+        self.assertTrue(all(line.startswith("[STEP] ") for line in lines[1:-1]))
+        self.assertRegex(
+            lines[-1],
+            r"^\[END\] success=(true|false) steps=\d+ score=\d+\.\d{2} rewards=.*$",
+        )
+        self.assertIn(f"score={result['score']:.2f}", lines[-1])
 
 
 if __name__ == "__main__":

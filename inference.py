@@ -14,12 +14,12 @@ configuration is missing.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import sys
 import time
 from collections import deque
+from contextlib import suppress
 from typing import Any
 
 from dotenv import load_dotenv
@@ -80,6 +80,7 @@ memory: dict[str, Any] = {
     "best_action": None,
     "reward_history": [],
     "recent_steps": deque(maxlen=3),
+    "last_action_error": None,
 }
 
 
@@ -89,6 +90,7 @@ def reset_memory() -> None:
     memory["best_action"] = None
     memory["reward_history"] = []
     memory["recent_steps"] = deque(maxlen=3)
+    memory["last_action_error"] = None
 
 
 def compact_action(action: Action) -> dict[str, Any]:
@@ -130,6 +132,13 @@ def compact_state(state: EnvironmentState) -> dict[str, Any]:
             compact_action(state.prev_action) if state.prev_action is not None else None
         ),
     }
+
+
+def normalize_log_error(error: Any) -> str:
+    """Return a single-line error token for structured logs."""
+    if error in {None, "", "null"}:
+        return "null"
+    return " ".join(str(error).split())
 
 
 def build_system_prompt(task_name: str, task_description: str) -> str:
@@ -255,6 +264,7 @@ def choose_action_with_llm(
 ) -> Action:
     """Query the configured LLM for the next action."""
     client = get_client()
+    memory["last_action_error"] = None
 
     if API_CALL_DELAY > 0:
         time.sleep(API_CALL_DELAY)
@@ -278,6 +288,7 @@ def choose_action_with_llm(
             response_format=Action,
         )
     except Exception as exc:
+        memory["last_action_error"] = normalize_log_error(exc)
         print(
             f"Warning: LLM returned invalid action ({exc}). Using neutral fallback.",
             file=sys.stderr,
@@ -287,6 +298,7 @@ def choose_action_with_llm(
 
     parsed = response.choices[0].message.parsed
     if parsed is None:
+        memory["last_action_error"] = "Model response did not contain a parsed Action."
         print(
             "Warning: Model response did not contain a parsed Action. Using neutral fallback.",
             file=sys.stderr,
@@ -322,12 +334,13 @@ def run_episode(task_name: str, episode_index: int, seed: int) -> dict[str, Any]
     reset_memory()
 
     runtime = OpenEnvRuntime()
-    observation = runtime.reset(task_name=task_name, seed=seed)
+    observation: Observation | None = None
     last_reward: float | None = None
     cumulative_reward = 0.0
     reward_values: list[float] = []
     done = False
     step_count = 0
+    score = sanitize_public_score(0.5)
     info: dict[str, Any] = {
         "task_success": False,
         "task_failed": False,
@@ -337,57 +350,88 @@ def run_episode(task_name: str, episode_index: int, seed: int) -> dict[str, Any]
 
     print(f"[START] task={task_name} env=openenv model={MODEL_NAME}", flush=True)
 
-    while not done:
-        state = runtime.state()
-        action = choose_action(
-            task_name=task_name,
-            task_description=task.description,
-            observation=observation,
-            state=state,
-            last_reward=last_reward,
+    try:
+        observation = runtime.reset(task_name=task_name, seed=seed)
+
+        while not done:
+            state = runtime.state()
+            action = choose_action(
+                task_name=task_name,
+                task_description=task.description,
+                observation=observation,
+                state=state,
+                last_reward=last_reward,
+            )
+            observation, reward, done, info = runtime.step(action)
+            reward.value = sanitize_public_score(reward.value)
+            memory["reward_history"].append(reward.value)
+
+            # Append a compact summary to the rolling history window
+            step_summary = (
+                f"T:{observation.temperature:.1f} P:{observation.pressure:.2f} "
+                f"Pur:{observation.purity:.1f} | "
+                f"Act(S:{action.steam_valve:.1f} R:{action.reflux_ratio:.1f} "
+                f"F:{action.feed_rate:.1f} V:{action.vent}) -> R:{reward.value:.3f}"
+            )
+            memory["recent_steps"].append(step_summary)
+
+            if reward.value > memory["best_reward"]:
+                memory["best_reward"] = reward.value
+                memory["best_action"] = action
+
+            cumulative_reward += reward.value
+            reward_values.append(reward.value)
+            last_reward = reward.value
+            step_count += 1
+
+            action_str = (
+                f"steam={action.steam_valve:.4f},"
+                f"reflux={action.reflux_ratio:.4f},"
+                f"feed={action.feed_rate:.4f},"
+                f"vent={int(action.vent)}"
+            )
+            done_str = str(bool(done)).lower()
+            error_str = normalize_log_error(memory.get("last_action_error"))
+            print(
+                f"[STEP] step={step_count} action={action_str} "
+                f"reward={reward.value:.2f} done={done_str} error={error_str}",
+                flush=True,
+            )
+
+        raw_score = compute_episode_score(
+            cumulative_reward=cumulative_reward,
+            success=bool(info.get("task_success", False)),
+            failed=bool(info.get("task_failed", False)),
+            steps=step_count,
+            max_steps=task.max_steps,
         )
-        observation, reward, done, info = runtime.step(action)
-        memory["reward_history"].append(reward.value)
-
-        # Append a compact summary to the rolling history window
-        step_summary = (
-            f"T:{observation.temperature:.1f} P:{observation.pressure:.2f} "
-            f"Pur:{observation.purity:.1f} | "
-            f"Act(S:{action.steam_valve:.1f} R:{action.reflux_ratio:.1f} "
-            f"F:{action.feed_rate:.1f} V:{action.vent}) -> R:{reward.value:.3f}"
+        average_reward = cumulative_reward / max(step_count, 1)
+        score = sanitize_public_score(0.7 * average_reward + 0.3 * raw_score)
+    except Exception as exc:
+        info["task_success"] = False
+        info["task_failed"] = True
+        info["failure_reason"] = normalize_log_error(exc)
+        raw_score = compute_episode_score(
+                cumulative_reward=cumulative_reward,
+                success=False,
+                failed=True,
+                steps=step_count,
+                max_steps=task.max_steps,
         )
-        memory["recent_steps"].append(step_summary)
-
-        if reward.value > memory["best_reward"]:
-            memory["best_reward"] = reward.value
-            memory["best_action"] = action
-
-        cumulative_reward += reward.value
-        reward_values.append(reward.value)
-        last_reward = reward.value
-        step_count += 1
-
-        action_str = (
-            f"steam={action.steam_valve:.4f},"
-            f"reflux={action.reflux_ratio:.4f},"
-            f"feed={action.feed_rate:.4f},"
-            f"vent={int(action.vent)}"
-        )
-        done_str = str(bool(done)).lower()
+        average_reward = cumulative_reward / max(step_count, 1)
+        score = sanitize_public_score(0.7 * average_reward + 0.3 * raw_score)
+        
+    finally:
+        assert 0.0 < score < 1.0
+        success = str(bool(info.get("task_success", False))).lower()
+        reward_list = ",".join(f"{reward_value:.2f}" for reward_value in reward_values)
         print(
-            f"[STEP] step={step_count} action={action_str} "
-            f"reward={reward.value:.2f} done={done_str} error=null",
+            f"[END] success={success} steps={step_count} "
+            f"score={score:.2f} rewards={reward_list}",
             flush=True,
         )
-
-    score = compute_episode_score(
-        cumulative_reward=cumulative_reward,
-        success=bool(info.get("task_success", False)),
-        failed=bool(info.get("task_failed", False)),
-        steps=step_count,
-        max_steps=task.max_steps,
-    )
-    score = sanitize_public_score(score)
+        with suppress(AttributeError):
+            runtime.close()
 
     result = {
         "task": task_name,
@@ -399,12 +443,8 @@ def run_episode(task_name: str, episode_index: int, seed: int) -> dict[str, Any]
         "failure_reason": str(info.get("failure_reason", "")),
         "cumulative_reward": cumulative_reward,
         "score": score,
-        "final_observation": compact_observation(observation),
+        "final_observation": compact_observation(observation) if observation is not None else None,
     }
-
-    success = str(bool(info.get("task_success", False))).lower()
-    reward_list = ",".join(f"{reward_value:.2f}" for reward_value in reward_values)
-    print(f"[END] success={success} steps={step_count} rewards={reward_list}", flush=True)
     return result
 
 
@@ -421,7 +461,7 @@ def summarize_results(
         if not task_results:
             continue
         task_scores[task_name] = sanitize_public_score(
-            sum(sanitize_public_score(result["score"]) for result in task_results) / len(task_results)
+            sum(result["score"] for result in task_results) / len(task_results)
         )
 
     total_weight = sum(TASK_WEIGHTS[name] for name in task_scores)
@@ -479,8 +519,7 @@ def run_all_tasks(
 
 def main() -> None:
     """Run the configured controller across all tasks."""
-    summary = run_all_tasks()
-    print(json.dumps(summary, sort_keys=True), flush=True)
+    run_all_tasks()
 
 
 if __name__ == "__main__":
