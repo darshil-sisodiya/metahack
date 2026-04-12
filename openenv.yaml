@@ -2,7 +2,7 @@
 name: openenv-distillation-control
 version: "0.2.0"
 description: Industrial distillation-column control benchmark with typed OpenEnv reset/step/state APIs.
-entrypoint: uvicorn server.main:app --host 0.0.0.0 --port 7860
+entrypoint: uvicorn server.app:app --host 0.0.0.0 --port 7860
 port: 7860
 framework: fastapi
 tags:
