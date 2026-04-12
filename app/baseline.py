@@ -61,7 +61,7 @@ def baseline_agent(obs: Observation) -> Action:
 
 def main() -> None:
     """Run baseline evaluation and print a compact summary."""
-    results = evaluate_all_tasks(baseline_agent, n_episodes=200)
+    results = evaluate_all_tasks(baseline_agent, n_episodes=200, include_details=True)
 
     print("BASELINE EVALUATION")
     print("Score Range: strictly between 0 and 1")
@@ -72,7 +72,7 @@ def main() -> None:
 
     print("Success Rates:")
     for task_name, task_details in results["details"].items():
-        success_rate = task_details["success_rate"] * 100.0
+        success_rate = 100.0 * task_details["success_count"] / task_details["episode_count"]
         print(f"  {task_name}: {success_rate:.1f}%")
 
 

@@ -25,9 +25,10 @@ from typing import Any
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from app.grader import TASK_WEIGHTS, compute_episode_score
+from app.grader import TASK_WEIGHTS, compute_episode_score, validate_strict_open_scores
 from app.models import Action, EnvironmentState, Observation
 from app.runtime import OpenEnvRuntime
+from app.scoring import sanitize_public_score
 from app.tasks import get_all_tasks, get_task_by_name
 
 load_dotenv()
@@ -45,16 +46,8 @@ API_CALL_DELAY = max(0.0, float(os.environ.get("API_CALL_DELAY", "0")))
 
 AGENT_MODE = "llm"
 
-SCORE_MIN = 0.001
-SCORE_MAX = 0.999
 
-
-def clamp_open_score(value: float) -> float:
-    """Clamp a score to the strict-open submission range (0, 1)."""
-    return max(SCORE_MIN, min(SCORE_MAX, float(value)))
-
-
-def build_client() -> OpenAI | None:
+def build_client() -> OpenAI:
     """Create the OpenAI-compatible client when running in LLM mode."""
     if not API_BASE_URL:
         raise RuntimeError("API_BASE_URL must be set for inference.py.")
@@ -72,7 +65,15 @@ def build_client() -> OpenAI | None:
     )
 
 
-CLIENT = build_client()
+CLIENT: OpenAI | None = None
+
+
+def get_client() -> OpenAI:
+    """Lazily initialize the OpenAI-compatible client."""
+    global CLIENT  # noqa: PLW0603
+    if CLIENT is None:
+        CLIENT = build_client()
+    return CLIENT
 
 memory: dict[str, Any] = {
     "best_reward": -1e9,
@@ -253,14 +254,13 @@ def choose_action_with_llm(
     last_reward: float | None,
 ) -> Action:
     """Query the configured LLM for the next action."""
-    if CLIENT is None:
-        raise RuntimeError("LLM mode requested without an initialized client.")
+    client = get_client()
 
     if API_CALL_DELAY > 0:
         time.sleep(API_CALL_DELAY)
 
     try:
-        response = CLIENT.beta.chat.completions.parse(
+        response = client.beta.chat.completions.parse(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": build_system_prompt(task_name, task_description)},
@@ -387,7 +387,7 @@ def run_episode(task_name: str, episode_index: int, seed: int) -> dict[str, Any]
         steps=step_count,
         max_steps=task.max_steps,
     )
-    score = clamp_open_score(score)
+    score = sanitize_public_score(score)
 
     result = {
         "task": task_name,
@@ -408,7 +408,11 @@ def run_episode(task_name: str, episode_index: int, seed: int) -> dict[str, Any]
     return result
 
 
-def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize_results(
+    results: list[dict[str, Any]],
+    *,
+    episodes_per_task: int,
+) -> dict[str, Any]:
     """Aggregate per-episode results into task scores and an overall score."""
     task_scores: dict[str, float] = {}
 
@@ -416,21 +420,23 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         task_results = [result for result in results if result["task"] == task_name]
         if not task_results:
             continue
-        task_scores[task_name] = sum(result["score"] for result in task_results) / len(task_results)
-        task_scores[task_name] = clamp_open_score(task_scores[task_name])
+        task_scores[task_name] = sanitize_public_score(
+            sum(sanitize_public_score(result["score"]) for result in task_results) / len(task_results)
+        )
 
     total_weight = sum(TASK_WEIGHTS[name] for name in task_scores)
     weighted_total = sum(task_scores[name] * TASK_WEIGHTS[name] for name in task_scores)
     overall_score = weighted_total / total_weight if total_weight > 0 else 0.0
-    overall_score = clamp_open_score(overall_score)
+    overall_score = sanitize_public_score(overall_score)
+    validate_strict_open_scores(task_scores, overall_score)
 
     return {
         "kind": "summary",
         "mode": AGENT_MODE,
         "model": MODEL_NAME,
-        "episodes_per_task": OPENENV_EPISODES_PER_TASK,
-        "overall_score": round(overall_score, 6),
-        "task_scores": {name: round(score, 6) for name, score in task_scores.items()},
+        "episodes_per_task": episodes_per_task,
+        "overall_score": overall_score,
+        "task_scores": task_scores,
     }
 
 def agent_action(obs: Observation, state: EnvironmentState, last_reward: float | None):
@@ -441,14 +447,25 @@ def agent_action(obs: Observation, state: EnvironmentState, last_reward: float |
         state=state,
         last_reward=last_reward,
     )
-def main() -> None:
-    """Run the configured controller across all tasks."""
+
+
+def run_all_tasks(
+    *,
+    episodes_per_task: int | None = None,
+    base_seed: int | None = None,
+) -> dict[str, Any]:
+    """Run deterministic rollouts across all tasks and return a validated summary."""
+    resolved_episodes = OPENENV_EPISODES_PER_TASK if episodes_per_task is None else int(episodes_per_task)
+    resolved_base_seed = OPENENV_BASE_SEED if base_seed is None else int(base_seed)
+    if resolved_episodes <= 0:
+        raise ValueError("episodes_per_task must be positive")
+
     all_results: list[dict[str, Any]] = []
     ordered_tasks = [task.name for task in get_all_tasks()]
 
     for task_index, task_name in enumerate(ordered_tasks):
-        for episode_index in range(OPENENV_EPISODES_PER_TASK):
-            seed = OPENENV_BASE_SEED + task_index * 10_000 + episode_index
+        for episode_index in range(resolved_episodes):
+            seed = resolved_base_seed + task_index * 10_000 + episode_index
             all_results.append(
                 run_episode(
                     task_name=task_name,
@@ -457,7 +474,13 @@ def main() -> None:
                 )
             )
 
- 
+    return summarize_results(all_results, episodes_per_task=resolved_episodes)
+
+
+def main() -> None:
+    """Run the configured controller across all tasks."""
+    summary = run_all_tasks()
+    print(json.dumps(summary, sort_keys=True), flush=True)
 
 
 if __name__ == "__main__":

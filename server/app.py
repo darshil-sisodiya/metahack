@@ -16,6 +16,7 @@ if __package__ in {None, ""}:
 
 from app.models import Action, EnvironmentState, Observation, Reward
 from app.runtime import OpenEnvRuntime
+from app.scoring import sanitize_public_score
 
 
 class ResetRequest(BaseModel):
@@ -97,6 +98,20 @@ class EvaluateResponse(BaseModel):
     steps: int = 0
 
 
+class RunAgentRequest(BaseModel):
+    episodes_per_task: int = 1
+    base_seed: int = 42
+
+
+class RunAgentResponse(BaseModel):
+    kind: str
+    mode: str
+    model: str
+    episodes_per_task: int
+    overall_score: float
+    task_scores: dict[str, float]
+
+
 @app.post("/evaluate", response_model=EvaluateResponse)
 async def evaluate_env(request: EvaluateRequest | None = None) -> EvaluateResponse:
     """Evaluate a trajectory and return a clamped score strictly in (0, 1)."""
@@ -114,7 +129,7 @@ async def evaluate_env(request: EvaluateRequest | None = None) -> EvaluateRespon
     # If trajectory is empty or missing, return a safe default score
     if not trajectory:
         return EvaluateResponse(
-            score=max(0.1, min(0.99, 0.5)),
+            score=sanitize_public_score(0.5),
             success=False,
             failed=False,
             steps=0,
@@ -138,7 +153,7 @@ async def evaluate_env(request: EvaluateRequest | None = None) -> EvaluateRespon
     )
 
     # Final nuclear clamp — this value CANNOT be 0.0 or 1.0
-    score = max(0.1, min(0.99, float(score)))
+    score = sanitize_public_score(score)
 
     return EvaluateResponse(
         score=score,
@@ -146,6 +161,24 @@ async def evaluate_env(request: EvaluateRequest | None = None) -> EvaluateRespon
         failed=failed,
         steps=steps,
     )
+
+
+@app.post("/run-agent", response_model=RunAgentResponse)
+async def run_agent(request: RunAgentRequest | None = None) -> RunAgentResponse:
+    """Run the submission agent and return a validated summary payload."""
+    from inference import run_all_tasks
+
+    episodes_per_task = request.episodes_per_task if request else 1
+    base_seed = request.base_seed if request else 42
+
+    try:
+        summary = run_all_tasks(
+            episodes_per_task=episodes_per_task,
+            base_seed=base_seed,
+        )
+        return RunAgentResponse(**summary)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 def main():

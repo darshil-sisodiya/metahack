@@ -10,6 +10,7 @@ from typing import Any
 
 from app.env import DistillationEnv
 from app.models import Action, Observation
+from app.scoring import sanitize_public_score, validate_strict_open_scores as _validate_scores
 from app.tasks import BaseTask, get_all_tasks
 
 # Weighted contribution of each task to the final overall score.
@@ -18,10 +19,6 @@ TASK_WEIGHTS: dict[str, float] = {
     "optimization": 0.35,
     "emergency_control": 0.4,
 }
-
-SCORE_MIN = 0.001
-SCORE_MAX = 0.999
-SUBMISSION_ROUND_DIGITS = 6
 
 
 def random_agent(obs: Observation) -> Action:
@@ -40,35 +37,17 @@ def random_agent(obs: Observation) -> Action:
 
 def clamp_open_score(value: float) -> float:
     """Clamp a score into the strict-open range (0, 1)."""
-    return max(SCORE_MIN, min(SCORE_MAX, float(value)))
+    return sanitize_public_score(value)
 
 
 def to_submission_score(value: float) -> float:
     """Return a rounded score guaranteed to stay strictly inside (0, 1)."""
-    rounded = round(clamp_open_score(value), SUBMISSION_ROUND_DIGITS)
-    if rounded <= 0.0:
-        return 10 ** (-SUBMISSION_ROUND_DIGITS)
-    if rounded >= 1.0:
-        return 1.0 - (10 ** (-SUBMISSION_ROUND_DIGITS))
-    return rounded
+    return sanitize_public_score(value)
 
 
 def validate_strict_open_scores(task_scores: dict[str, float], overall_score: float) -> None:
     """Raise when any emitted score violates strict-open validator constraints."""
-    missing_tasks = [task_name for task_name in TASK_WEIGHTS if task_name not in task_scores]
-    if missing_tasks:
-        raise ValueError(f"Missing task scores for: {', '.join(sorted(missing_tasks))}")
-
-    for task_name, score in task_scores.items():
-        if not (0.0 < score < 1.0):
-            raise ValueError(
-                f"Task score for '{task_name}' must be strictly between 0 and 1. Got: {score}"
-            )
-
-    if not (0.0 < overall_score < 1.0):
-        raise ValueError(
-            f"Overall score must be strictly between 0 and 1. Got: {overall_score}"
-        )
+    _validate_scores(task_scores, overall_score, expected_tasks=TASK_WEIGHTS)
 
 
 def _coerce_action(action: Action | dict[str, Any]) -> Action:
@@ -119,7 +98,7 @@ def _compute_episode_score(
         # Failed episodes still receive some partial credit for strong control.
         score = min(score, 0.3 + performance_score * 0.5)
 
-    return clamp_open_score(score)
+    return sanitize_public_score(score)
 
 
 def compute_episode_score(
@@ -197,6 +176,8 @@ def evaluate_episode(task: BaseTask, seed: int) -> dict[str, Any]:
 def evaluate_all_tasks(
     agent_fn: Callable[[Observation], Action | dict[str, Any]],
     n_episodes: int = 20,
+    *,
+    include_details: bool = False,
 ) -> dict[str, Any]:
     """Evaluate an agent across all tasks with deterministic seeded rollouts.
 
@@ -224,28 +205,35 @@ def evaluate_all_tasks(
             task_instance = type(task_template)()
             episode_results.append(_run_episode(task_instance, seed, agent_fn))
 
-        avg_score = sum(result["score"] for result in episode_results) / n_episodes
-        avg_score = clamp_open_score(avg_score)
-        success_rate = sum(1 for result in episode_results if result["success"]) / n_episodes
-        failure_rate = sum(1 for result in episode_results if result["failed"]) / n_episodes
-        avg_steps = sum(result["steps"] for result in episode_results) / n_episodes
+        episode_count = len(episode_results)
+        avg_score = sanitize_public_score(
+            sum(sanitize_public_score(result["score"]) for result in episode_results) / episode_count
+        )
+        success_count = sum(1 for result in episode_results if result["success"])
+        failure_count = sum(1 for result in episode_results if result["failed"])
+        avg_steps = sum(result["steps"] for result in episode_results) / episode_count
 
         task_scores[task_name] = avg_score
-        details[task_name] = {
-            "avg_score": avg_score,
-            "success_rate": success_rate,
-            "failure_rate": failure_rate,
-            "avg_steps": avg_steps,
-            "episodes": episode_results,
-        }
+        if include_details:
+            details[task_name] = {
+                "avg_score": avg_score,
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "episode_count": episode_count,
+                "avg_steps": round(avg_steps, 3),
+                "episodes": episode_results,
+            }
 
     weighted_total = sum(task_scores[name] * TASK_WEIGHTS[name] for name in task_scores)
     total_weight = sum(TASK_WEIGHTS[name] for name in task_scores)
     overall_score = weighted_total / total_weight if total_weight > 0 else 0.5
-    overall_score = clamp_open_score(overall_score)
+    overall_score = sanitize_public_score(overall_score)
+    validate_strict_open_scores(task_scores, overall_score)
 
-    return {
+    result = {
         "overall_score": overall_score,
         "task_scores": task_scores,
-        "details": details,
     }
+    if include_details:
+        result["details"] = details
+    return result

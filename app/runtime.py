@@ -6,6 +6,7 @@ from typing import Any
 
 from app.env import DistillationEnv
 from app.models import Action, EnvironmentState, Observation, Reward
+from app.scoring import sanitize_public_score
 from app.tasks import BaseTask, get_all_tasks, get_task_by_name
 
 
@@ -44,13 +45,13 @@ class OpenEnvRuntime:
             raise ValueError("Environment not initialized. Call reset() first.")
         observation, reward, done, info = self.task.step(self.env, action)
 
-        # Nuclear clamp: guarantee reward.value is strictly in (0, 1)
-        reward.value = max(0.1, min(0.99, float(reward.value)))
+        # Keep validator-visible values in the strict-open public band.
+        reward.value = sanitize_public_score(reward.value)
 
         # Clamp any score-like values that may exist in the info dict
-        for key in ("score", "task_score", "episode_score"):
+        for key in ("score", "task_score", "episode_score", "overall_score"):
             if key in info:
-                info[key] = max(0.1, min(0.99, float(info[key])))
+                info[key] = sanitize_public_score(info[key])
 
         return observation, reward, done, info
 
