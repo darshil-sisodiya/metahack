@@ -72,7 +72,7 @@ The agent interacts with a rigorous physical simulation with continuous floating
 1. **Physics Engine** applies the previous continuous action through delayed actuators. It introduces deterministic noise and computes thermal inertia. 
 2. **Task Config** calculates a hidden instability factor. If the agent causes wild oscillations, the system artificially escalates the pressure. 
 3. **Agent (Qwen2.5-7B-Instruct)** receives the telemetry and outputs a strict JSON payload deciding the next 4 control variables.
-4. **Grader** computes a continuous reward based on distance to optimal states, applying deep penalties for excessive action-switching or wasted energy. 
+4. **Grader** computes a continuous reward based on distance to optimal states, applying deep penalties for excessive action-switching or wasted energy. The submission runner then blends average per-step reward with the raw episode score before emitting a final strict-open score. 
 
 ---
 
@@ -122,7 +122,9 @@ The reward function is **continuous**, bypassing typical sparse RL feedback mech
 - **Energy Misuse Penalty** — If cumulative energy spikes too quickly relative to past steps, the system incurs a harsh percentage-based penalty.
 - **Critical Failure** — Terminating safety limit breach triggers a fast `-1.0` and ends the episode instantly.
 
-This layered continuous calculation allows the `Grader` to evaluate success between exactly 0.0 and 1.0.
+This layered continuous calculation feeds the grader and submission runner without collapsing early to binary outcomes.
+
+Internally, the environment keeps step rewards continuous and non-binary. For submission output, `inference.py` blends `0.7 * average_step_reward + 0.3 * raw_episode_score`, then sanitizes only at the public emission stage so every reported task score remains strictly inside `(0, 1)`.
 
 ---
 
@@ -173,6 +175,15 @@ cp .env.example .env
 # Edit .env variables, then execute the evaluation:
 python inference.py
 ```
+
+The submission runner emits structured stdout in the required three-line pattern only:
+```text
+[START] task=<task_name> env=openenv model=<model_name>
+[STEP] step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+[END] success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
+```
+
+`reward` and `rewards` are printed to 2 decimal places, booleans are lowercase, and the `score` printed on the `[END]` line is the exact same strict-open score used internally for the episode result. The FastAPI app also exposes `/run-agent` for validated multi-task rollouts.
 
 ## Configuration
 `openenv.yaml` dictates thresholds seamlessly across Tasks:
